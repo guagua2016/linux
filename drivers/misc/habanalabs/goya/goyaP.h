@@ -9,6 +9,7 @@
 #define GOYAP_H_
 
 #include "habanalabs.h"
+#include "include/goya/goya_boot_if.h"
 #include "include/goya/goya.h"
 
 #define NUMBER_OF_CMPLT_QUEUES		5
@@ -121,5 +122,7 @@ struct goya_device {
 	u64		ddr_bar_cur_addr;
 	u32		hw_cap_initialized;
 };
+
+void goya_init_security(struct hl_device *hdev);
 
 #endif /* GOYAP_H_ */

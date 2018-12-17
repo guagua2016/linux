@@ -11,6 +11,7 @@
 #define GOYA_H
 
 #include "asic_reg/goya_regs.h"
+#include "goya_async_events.h"
 
 #include <linux/types.h>
 

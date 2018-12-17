@@ -65,7 +65,6 @@
 
 #define GOYA_MSIX_ENTRIES	8
 #define EVENT_QUEUE_MSIX_IDX	5
-#define ARMCP_RESET_MSIX_IDX	6
 
 #define QMAN_PQ_ENTRY_SIZE	16			/* Bytes */
 

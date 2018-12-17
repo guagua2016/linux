@@ -91,9 +91,9 @@ int hl_device_open(struct inode *inode, struct file *filp)
 
 	mutex_lock(&hdev->device_open);
 
-	if (hdev->disabled) {
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset))) {
 		dev_err_ratelimited(hdev->dev,
-			"Can't open %s because it is disabled\n",
+			"Can't open %s because it is disabled or in reset\n",
 			dev_name(hdev->dev));
 		mutex_unlock(&hdev->device_open);
 		return -EPERM;
@@ -195,6 +195,7 @@ int create_hdev(struct hl_device **dev, struct pci_dev *pdev,
 	hdev->fw_loading = 1;
 	hdev->ifh = 0;
 	hdev->pldm = 0;
+	hdev->heartbeat = 1;
 
 	/* If CPU is disabled, no point in loading FW */
 	if (!hdev->cpu_enable)
@@ -203,6 +204,10 @@ int create_hdev(struct hl_device **dev, struct pci_dev *pdev,
 	/* If we don't load FW, no need to initialize CPU queues */
 	if (!hdev->fw_loading)
 		hdev->cpu_queues_enable = 0;
+
+	/* If CPU queues not enabled, no way to do heartbeat */
+	if (!hdev->cpu_queues_enable)
+		hdev->heartbeat = 0;
 
 	hdev->disabled = true;
 	hdev->pdev = pdev; /* can be NULL in case of simulator device */

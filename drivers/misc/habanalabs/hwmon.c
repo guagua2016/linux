@@ -111,7 +111,7 @@ static int hl_read(struct device *dev, enum hwmon_sensor_types type,
 {
 	struct hl_device *hdev = dev_get_drvdata(dev);
 
-	if (hdev->disabled)
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset)))
 		return -ENODEV;
 
 	switch (type) {
@@ -185,7 +185,7 @@ static int hl_write(struct device *dev, enum hwmon_sensor_types type,
 {
 	struct hl_device *hdev = dev_get_drvdata(dev);
 
-	if (hdev->disabled)
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset)))
 		return -ENODEV;
 
 	switch (type) {

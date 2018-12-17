@@ -104,7 +104,7 @@ static ssize_t pm_mng_profile_show(struct device *dev,
 {
 	struct hl_device *hdev = dev_get_drvdata(dev);
 
-	if (hdev->disabled)
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset)))
 		return -ENODEV;
 
 	return snprintf(buf, PAGE_SIZE, "%s\n",
@@ -118,7 +118,7 @@ static ssize_t pm_mng_profile_store(struct device *dev,
 {
 	struct hl_device *hdev = dev_get_drvdata(dev);
 
-	if (hdev->disabled) {
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset))) {
 		count = -ENODEV;
 		goto out;
 	}
@@ -162,7 +162,7 @@ static ssize_t high_pll_show(struct device *dev, struct device_attribute *attr,
 {
 	struct hl_device *hdev = dev_get_drvdata(dev);
 
-	if (hdev->disabled)
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset)))
 		return -ENODEV;
 
 	return snprintf(buf, PAGE_SIZE, "%u\n", hdev->high_pll);
@@ -175,7 +175,7 @@ static ssize_t high_pll_store(struct device *dev, struct device_attribute *attr,
 	long value;
 	int rc;
 
-	if (hdev->disabled) {
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset))) {
 		count = -ENODEV;
 		goto out;
 	}
@@ -263,6 +263,48 @@ static ssize_t preboot_btl_ver_show(struct device *dev,
 	return snprintf(buf, PAGE_SIZE, "%s\n", hdev->asic_prop.preboot_ver);
 }
 
+static ssize_t soft_reset_store(struct device *dev,
+				struct device_attribute *attr, const char *buf,
+				size_t count)
+{
+	struct hl_device *hdev = dev_get_drvdata(dev);
+	long value;
+	int rc;
+
+	rc = kstrtoul(buf, 0, &value);
+
+	if (rc) {
+		count = -EINVAL;
+		goto out;
+	}
+
+	hl_device_reset(hdev, false, false);
+
+out:
+	return count;
+}
+
+static ssize_t hard_reset_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct hl_device *hdev = dev_get_drvdata(dev);
+	long value;
+	int rc;
+
+	rc = kstrtoul(buf, 0, &value);
+
+	if (rc) {
+		count = -EINVAL;
+		goto out;
+	}
+
+	hl_device_reset(hdev, true, false);
+
+out:
+	return count;
+}
+
 static ssize_t device_type_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -304,7 +346,9 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr,
 	struct hl_device *hdev = dev_get_drvdata(dev);
 	char *str;
 
-	if (hdev->disabled)
+	if (atomic_read(&hdev->in_reset))
+		str = "In reset";
+	else if (hdev->disabled)
 		str = "Malfunction";
 	else
 		str = "Operational";
@@ -320,13 +364,29 @@ static ssize_t write_open_cnt_show(struct device *dev,
 	return snprintf(buf, PAGE_SIZE, "%d\n", hdev->user_ctx ? 1 : 0);
 }
 
+static ssize_t soft_reset_cnt_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct hl_device *hdev = dev_get_drvdata(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", hdev->soft_reset_cnt);
+}
+
+static ssize_t hard_reset_cnt_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct hl_device *hdev = dev_get_drvdata(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", hdev->hard_reset_cnt);
+}
+
 static ssize_t max_power_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
 {
 	struct hl_device *hdev = dev_get_drvdata(dev);
 	long val;
 
-	if (hdev->disabled)
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset)))
 		return -ENODEV;
 
 	val = hl_get_max_power(hdev);
@@ -341,7 +401,7 @@ static ssize_t max_power_store(struct device *dev,
 	unsigned long value;
 	int rc;
 
-	if (hdev->disabled) {
+	if ((hdev->disabled) || (atomic_read(&hdev->in_reset))) {
 		count = -ENODEV;
 		goto out;
 	}
@@ -398,10 +458,14 @@ static DEVICE_ATTR_RO(infineon_ver);
 static DEVICE_ATTR_RO(fuse_ver);
 static DEVICE_ATTR_RO(thermal_ver);
 static DEVICE_ATTR_RO(preboot_btl_ver);
+static DEVICE_ATTR_WO(soft_reset);
+static DEVICE_ATTR_WO(hard_reset);
 static DEVICE_ATTR_RO(device_type);
 static DEVICE_ATTR_RO(pci_addr);
 static DEVICE_ATTR_RO(status);
 static DEVICE_ATTR_RO(write_open_cnt);
+static DEVICE_ATTR_RO(soft_reset_cnt);
+static DEVICE_ATTR_RO(hard_reset_cnt);
 static DEVICE_ATTR_RW(max_power);
 
 static const struct bin_attribute bin_attr_eeprom = {
@@ -487,11 +551,23 @@ int hl_sysfs_init(struct hl_device *hdev)
 		goto remove_thermal_ver;
 	}
 
+	rc = device_create_file(hdev->dev, &dev_attr_soft_reset);
+	if (rc) {
+		dev_err(hdev->dev, "failed to create device file soft_reset\n");
+		goto remove_preboot_ver;
+	}
+
+	rc = device_create_file(hdev->dev, &dev_attr_hard_reset);
+	if (rc) {
+		dev_err(hdev->dev, "failed to create device file hard_reset\n");
+		goto remove_soft_reset;
+	}
+
 	rc = device_create_file(hdev->dev, &dev_attr_device_type);
 	if (rc) {
 		dev_err(hdev->dev,
 			"failed to create device file device_type\n");
-		goto remove_preboot_ver;
+		goto remove_hard_reset;
 	}
 
 	rc = device_create_file(hdev->dev, &dev_attr_pci_addr);
@@ -513,13 +589,27 @@ int hl_sysfs_init(struct hl_device *hdev)
 		goto remove_status;
 	}
 
+	rc = device_create_file(hdev->dev, &dev_attr_soft_reset_cnt);
+	if (rc) {
+		dev_err(hdev->dev,
+			"failed to create device file soft_reset_count\n");
+		goto remove_write_open_cnt;
+	}
+
+	rc = device_create_file(hdev->dev, &dev_attr_hard_reset_cnt);
+	if (rc) {
+		dev_err(hdev->dev,
+			"failed to create device file hard_reset_count\n");
+		goto remove_soft_reset_cnt;
+	}
+
 	hdev->max_power = hdev->asic_prop.max_power_default;
 
 	rc = device_create_file(hdev->dev, &dev_attr_max_power);
 	if (rc) {
 		dev_err(hdev->dev,
 			"failed to create device file max_power\n");
-		goto remove_write_open_cnt;
+		goto remove_hard_reset_cnt;
 	}
 
 	rc = sysfs_create_bin_file(&hdev->dev->kobj, &bin_attr_eeprom);
@@ -532,6 +622,10 @@ int hl_sysfs_init(struct hl_device *hdev)
 
 remove_attr_max_power:
 	device_remove_file(hdev->dev, &dev_attr_max_power);
+remove_hard_reset_cnt:
+	device_remove_file(hdev->dev, &dev_attr_hard_reset_cnt);
+remove_soft_reset_cnt:
+	device_remove_file(hdev->dev, &dev_attr_soft_reset_cnt);
 remove_write_open_cnt:
 	device_remove_file(hdev->dev, &dev_attr_write_open_cnt);
 remove_status:
@@ -540,6 +634,10 @@ remove_pci_addr:
 	device_remove_file(hdev->dev, &dev_attr_pci_addr);
 remove_device_type:
 	device_remove_file(hdev->dev, &dev_attr_device_type);
+remove_hard_reset:
+	device_remove_file(hdev->dev, &dev_attr_hard_reset);
+remove_soft_reset:
+	device_remove_file(hdev->dev, &dev_attr_soft_reset);
 remove_preboot_ver:
 	device_remove_file(hdev->dev, &dev_attr_preboot_btl_ver);
 remove_thermal_ver:
@@ -570,10 +668,14 @@ void hl_sysfs_fini(struct hl_device *hdev)
 {
 	sysfs_remove_bin_file(&hdev->dev->kobj, &bin_attr_eeprom);
 	device_remove_file(hdev->dev, &dev_attr_max_power);
+	device_remove_file(hdev->dev, &dev_attr_hard_reset_cnt);
+	device_remove_file(hdev->dev, &dev_attr_soft_reset_cnt);
 	device_remove_file(hdev->dev, &dev_attr_write_open_cnt);
 	device_remove_file(hdev->dev, &dev_attr_status);
 	device_remove_file(hdev->dev, &dev_attr_pci_addr);
 	device_remove_file(hdev->dev, &dev_attr_device_type);
+	device_remove_file(hdev->dev, &dev_attr_hard_reset);
+	device_remove_file(hdev->dev, &dev_attr_soft_reset);
 	device_remove_file(hdev->dev, &dev_attr_preboot_btl_ver);
 	device_remove_file(hdev->dev, &dev_attr_thermal_ver);
 	device_remove_file(hdev->dev, &dev_attr_fuse_ver);

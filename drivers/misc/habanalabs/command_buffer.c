@@ -81,9 +81,10 @@ int hl_cb_create(struct hl_device *hdev, struct hl_cb_mgr *mgr,
 	bool alloc_new_cb = true;
 	int rc;
 
-	if (hdev->disabled) {
+	if ((hdev->disabled) || ((atomic_read(&hdev->in_reset)) &&
+					(ctx_id != HL_KERNEL_ASID_ID))) {
 		dev_warn_ratelimited(hdev->dev,
-			"Device is disabled !!! Can't create new CBs\n");
+			"Device is disabled or in reset !!! Can't create new CBs\n");
 		rc = -EBUSY;
 		goto out_err;
 	}
@@ -186,6 +187,12 @@ int hl_cb_ioctl(struct hl_fpriv *hpriv, void *data)
 	struct hl_device *hdev = hpriv->hdev;
 	u64 handle;
 	int rc;
+
+	if (hdev->hard_reset_pending) {
+		dev_crit_ratelimited(hdev->dev,
+			"Device HARD reset pending !!! Please close FD\n");
+		return -ENODEV;
+	}
 
 	switch (args->in.op) {
 	case HL_CB_OP_CREATE:

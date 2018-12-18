@@ -604,8 +604,10 @@ again:
 	/* Reset the H/W. It will be in idle state after this returns */
 	hdev->asic_funcs->hw_fini(hdev, hard_reset);
 
-	if (hard_reset)
+	if (hard_reset) {
+		hl_vm_fini(hdev);
 		hl_eq_reset(hdev, &hdev->event_queue);
+	}
 
 	/* Re-initialize PI,CI to 0 in all queues (hw queue, cq) */
 	hl_hw_queue_reset(hdev, hard_reset);
@@ -663,6 +665,13 @@ again:
 		if (rc) {
 			dev_err(hdev->dev,
 				"Failed late init after hard reset\n");
+			goto out_err;
+		}
+
+		rc = hl_vm_init(hdev);
+		if (rc) {
+			dev_err(hdev->dev,
+				"Failed to init memory module after hard reset\n");
 			goto out_err;
 		}
 
@@ -844,6 +853,13 @@ int hl_device_init(struct hl_device *hdev, struct class *hclass)
 		hdev->asic_name,
 		hdev->asic_prop.dram_size / 1024 / 1024 / 1024);
 
+	rc = hl_vm_init(hdev);
+	if (rc) {
+		dev_err(hdev->dev, "Failed to initialize memory module\n");
+		rc = 0;
+		goto out_disabled;
+	}
+
 	rc = hl_hwmon_init(hdev);
 	if (rc) {
 		dev_err(hdev->dev, "Failed to initialize hwmon\n");
@@ -954,6 +970,8 @@ void hl_device_fini(struct hl_device *hdev)
 
 	/* Reset the H/W. It will be in idle state after this returns */
 	hdev->asic_funcs->hw_fini(hdev, true);
+
+	hl_vm_fini(hdev);
 
 	hl_eq_fini(hdev, &hdev->event_queue);
 

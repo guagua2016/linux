@@ -22,6 +22,8 @@ static void hpriv_release(struct kref *ref)
 
 	put_pid(hpriv->taskpid);
 
+	hl_debugfs_remove_file(hpriv);
+
 	mutex_destroy(&hpriv->restore_phase_mutex);
 
 	kfree(hpriv);
@@ -807,6 +809,8 @@ int hl_device_init(struct hl_device *hdev, struct class *hclass)
 		goto free_cb_pool;
 	}
 
+	hl_debugfs_add_device(hdev);
+
 	rc = hdev->asic_funcs->hw_init(hdev);
 	if (rc) {
 		dev_err(hdev->dev, "failed to initialize the H/W\n");
@@ -935,6 +939,8 @@ void hl_device_fini(struct hl_device *hdev)
 	hl_hwmon_fini(hdev);
 
 	device_late_fini(hdev);
+
+	hl_debugfs_remove_device(hdev);
 
 	hl_sysfs_fini(hdev);
 

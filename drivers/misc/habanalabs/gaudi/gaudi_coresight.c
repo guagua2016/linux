@@ -16,6 +16,11 @@
 #define SPMU_SECTION_SIZE		MME0_ACC_SPMU_MAX_OFFSET
 #define SPMU_EVENT_TYPES_OFFSET		0x400
 #define SPMU_MAX_COUNTERS		6
+#define PMSCR				0x6F0	/* Snapshot Control */
+#define PMEVCNTSR0			0x620	/* Event Counters Snapshot */
+#define PMOVSSR				0x614	/* Overflow Status Snapshot */
+#define PMCCNTSR_L			0x618	/* Cycle Counter Snapshot */
+#define PMCCNTSR_H			0x61c	/* Cycle Counter Snapshot */
 
 static u64 debug_stm_regs[GAUDI_STM_LAST + 1] = {
 	[GAUDI_STM_MME0_ACC]	= mmMME0_ACC_STM_BASE,
@@ -752,6 +757,27 @@ static int gaudi_config_bmon(struct hl_device *hdev,
 	return 0;
 }
 
+static bool gaudi_reg_is_nic_spmu(enum gaudi_debug_spmu_regs_index reg_idx)
+{
+	switch (reg_idx) {
+	case GAUDI_SPMU_NIC0_0:
+	case GAUDI_SPMU_NIC0_1:
+	case GAUDI_SPMU_NIC1_0:
+	case GAUDI_SPMU_NIC1_1:
+	case GAUDI_SPMU_NIC2_0:
+	case GAUDI_SPMU_NIC2_1:
+	case GAUDI_SPMU_NIC3_0:
+	case GAUDI_SPMU_NIC3_1:
+	case GAUDI_SPMU_NIC4_0:
+	case GAUDI_SPMU_NIC4_1:
+		return true;
+	default:
+		break;
+	}
+
+	return false;
+}
+
 static int gaudi_config_spmu(struct hl_device *hdev,
 		struct hl_debug_params *params)
 {
@@ -767,6 +793,16 @@ static int gaudi_config_spmu(struct hl_device *hdev,
 	if (params->reg_idx >= ARRAY_SIZE(debug_spmu_regs)) {
 		dev_err(hdev->dev, "Invalid register index in SPMU\n");
 		return -EINVAL;
+	}
+
+	/*
+	 * NIC spmus are now configured by driver at init
+	 * and not accessible to user in dbg mode
+	 */
+	if (hdev->in_debug && gaudi_reg_is_nic_spmu(params->reg_idx)) {
+		dev_err(hdev->dev,
+			"Rejecting user debug configuration for NIC spmu\n");
+		return -EFAULT;
 	}
 
 	base_reg = debug_spmu_regs[params->reg_idx] - CFG_BASE;
@@ -835,6 +871,114 @@ static int gaudi_config_spmu(struct hl_device *hdev,
 	}
 
 	return 0;
+}
+
+static int gaudi_sample_spmu(struct hl_device *hdev,
+		struct hl_debug_params *params)
+{
+	u32 output_arr_len;
+	u32 cycle_cnt_idx;
+	u32 overflow_idx;
+	u32 events_num;
+	u64 base_reg;
+	u64 *output;
+	int i;
+
+	if (params->reg_idx >= ARRAY_SIZE(debug_spmu_regs)) {
+		dev_err(hdev->dev, "Invalid register index in SPMU\n");
+		return -EINVAL;
+	}
+
+	base_reg = debug_spmu_regs[params->reg_idx] - CFG_BASE;
+
+	output = params->output;
+	output_arr_len = params->output_size / 8;
+	events_num = output_arr_len - 2;
+	overflow_idx = output_arr_len - 2;
+	cycle_cnt_idx = output_arr_len - 1;
+
+	if (!output)
+		return -EINVAL;
+
+	if (output_arr_len < 1) {
+		dev_err(hdev->dev,
+			"not enough values for SPMU sample\n");
+		return -EINVAL;
+	}
+
+	if (events_num > SPMU_MAX_COUNTERS) {
+		dev_err(hdev->dev,
+			"too many events values for SPMU sample\n");
+		return -EINVAL;
+	}
+
+	/* capture */
+	WREG32(base_reg + PMSCR, 1);
+
+	/* read the shadow registers */
+	for (i = 0 ; i < events_num ; i++)
+		output[i] = RREG32(base_reg + PMEVCNTSR0 + i * 4);
+
+	/* also get overflow and cyclecount */
+	if (output_arr_len == SPMU_MAX_COUNTERS + 2) {
+		output[overflow_idx] = RREG32(base_reg + PMOVSSR);
+
+		output[cycle_cnt_idx] = RREG32(base_reg + PMCCNTSR_H);
+		output[cycle_cnt_idx] <<= 32;
+		output[cycle_cnt_idx] |= RREG32(base_reg + PMCCNTSR_L);
+	}
+
+	return 0;
+}
+
+int gaudi_config_spmu_nic(struct hl_device *hdev, u32 port,
+		u32 num_event_types, u32 event_types[])
+{
+	struct hl_debug_params_spmu spmu;
+	struct hl_debug_params params;
+	int i;
+
+	/* validate nic port */
+	if  (!gaudi_reg_is_nic_spmu(GAUDI_SPMU_NIC0_0 + port)) {
+		dev_err(hdev->dev, "Invalid nic port %u\n", port);
+		return -EFAULT;
+	}
+
+	memset(&params, 0, sizeof(struct hl_debug_params));
+	params.op = HL_DEBUG_OP_SPMU;
+	params.input = &spmu;
+	params.enable = true;
+	params.reg_idx = GAUDI_SPMU_NIC0_0 + port;
+
+	memset(&spmu, 0, sizeof(struct hl_debug_params_spmu));
+	spmu.event_types_num  = num_event_types;
+
+	for (i = 0 ; i < spmu.event_types_num ; i++)
+		spmu.event_types[i] = event_types[i];
+
+	return gaudi_config_spmu(hdev, &params);
+}
+
+int gaudi_sample_spmu_nic(struct hl_device *hdev, u32 port,
+		u32 num_out_data, u64 out_data[])
+{
+	struct hl_debug_params params;
+
+	if (!hdev->supports_coresight)
+		return 0;
+
+	/* validate nic port */
+	if  (!gaudi_reg_is_nic_spmu(GAUDI_SPMU_NIC0_0 + port)) {
+		dev_err(hdev->dev, "Invalid nic port %u\n", port);
+		return -EFAULT;
+	}
+
+	memset(&params, 0, sizeof(struct hl_debug_params));
+	params.output = out_data;
+	params.output_size = num_out_data * sizeof(uint64_t);
+	params.reg_idx = GAUDI_SPMU_NIC0_0 + port;
+
+	return gaudi_sample_spmu(hdev, &params);
 }
 
 int gaudi_debug_coresight(struct hl_device *hdev, void *data)

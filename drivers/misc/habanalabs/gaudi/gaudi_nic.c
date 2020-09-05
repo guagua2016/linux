@@ -2778,6 +2778,7 @@ static int port_register(struct hl_device *hdev, int port)
 	ndev->dev_port = port;
 
 	ndev->netdev_ops = &gaudi_nic_netdev_ops;
+	ndev->ethtool_ops = &gaudi_nic_ethtool_ops;
 	ndev->watchdog_timeo = NIC_TX_TIMEOUT;
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = NIC_MAX_MTU;
@@ -2800,6 +2801,8 @@ static int port_register(struct hl_device *hdev, int port)
 				"PHY power up 1 failed for port %d\n",
 				port);
 	}
+
+	gaudi->nic_spmu_init(hdev, port);
 
 	if (register_netdev(ndev)) {
 		dev_err(hdev->dev,
@@ -3264,6 +3267,8 @@ void gaudi_nic_ports_reopen(struct hl_device *hdev)
 			atomic_set(&gaudi_nic->in_reset, 0);
 			continue;
 		}
+
+		gaudi->nic_spmu_init(hdev, port);
 
 		schedule_delayed_work(&gaudi_nic->port_open_work,
 					msecs_to_jiffies(1));

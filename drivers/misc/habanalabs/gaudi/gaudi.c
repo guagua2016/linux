@@ -1044,6 +1044,7 @@ static int gaudi_sw_init(struct hl_device *hdev)
 	gaudi->cpucp_info_get = gaudi_cpucp_info_get;
 	gaudi->nic_handle_rx = gaudi_nic_handle_rx;
 	gaudi->nic_handle_tx = gaudi_nic_handle_tx;
+	gaudi->nic_spmu_init = gaudi_nic_spmu_init;
 
 	gaudi->max_freq_value = GAUDI_MAX_CLK_FREQ;
 

@@ -242,6 +242,7 @@ static void set_driver_behavior_per_device(struct hl_device *hdev)
 	hdev->bmc_enable = 1;
 	hdev->hard_reset_on_fw_events = 1;
 	hdev->card_type = cpucp_card_type_pci;
+	hdev->nic_ports_mask = 0x3FF;
 	hdev->nic_ports_ext_mask = 0x3FF;
 	hdev->nic_auto_neg_mask = 0x3FF;
 	hdev->nic_load_fw = 0;

@@ -5269,6 +5269,16 @@ static enum hl_device_hw_state goya_get_hw_state(struct hl_device *hdev)
 	return RREG32(mmHW_STATE);
 }
 
+static int goya_nic_init(struct hl_device *hdev)
+{
+	return 0;
+}
+
+static void goya_nic_fini(struct hl_device *hdev)
+{
+
+}
+
 static int goya_nic_control(struct hl_device *hdev, u32 op, void *input,
 			void *output)
 {
@@ -5409,6 +5419,8 @@ static const struct hl_asic_funcs goya_funcs = {
 	.get_eeprom_data = goya_get_eeprom_data,
 	.send_cpu_message = goya_send_cpu_message,
 	.get_hw_state = goya_get_hw_state,
+	.nic_init = goya_nic_init,
+	.nic_fini = goya_nic_fini,
 	.nic_control = goya_nic_control,
 	.nic_cq_mmap = goya_nic_mmap,
 	.pci_bars_map = goya_pci_bars_map,

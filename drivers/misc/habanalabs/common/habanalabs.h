@@ -697,6 +697,10 @@ struct hl_info_mac_addr;
  *                    then the timeout is the default timeout for the specific
  *                    ASIC
  * @get_hw_state: retrieve the H/W state
+ * @nic_init: init the NIC H/W and I/F. This should be called in the final satge
+ *            of the init flow, as we must not have anything that might fail
+ *            during its initialization after the NIC init.
+ * @nic_fini: perform NIC cleanup.
  * @nic_control: Perform NIC related operations.
  * @nic_cq_mmap: map the NIC CQ buffer.
  * @pci_bars_map: Map PCI BARs.
@@ -803,6 +807,8 @@ struct hl_asic_funcs {
 	int (*send_cpu_message)(struct hl_device *hdev, u32 *msg,
 				u16 len, u32 timeout, long *result);
 	enum hl_device_hw_state (*get_hw_state)(struct hl_device *hdev);
+	int (*nic_init)(struct hl_device *hdev);
+	void (*nic_fini)(struct hl_device *hdev);
 	int (*nic_control)(struct hl_device *hdev, u32 op, void *input,
 				void *output);
 	int (*nic_cq_mmap)(struct hl_device *hdev, struct vm_area_struct *vma);

@@ -1083,6 +1083,12 @@ again:
 			goto out_err;
 		}
 
+		rc = hdev->asic_funcs->nic_init(hdev);
+		if (rc) {
+			dev_err(hdev->dev, "Failed to init NIC driver\n");
+			goto out_err;
+		}
+
 		hl_set_max_power(hdev);
 	} else {
 		rc = hdev->asic_funcs->soft_reset_late_init(hdev);
@@ -1318,6 +1324,13 @@ int hl_device_init(struct hl_device *hdev, struct class *hclass)
 		goto out_disabled;
 	}
 
+	rc = hdev->asic_funcs->nic_init(hdev);
+	if (rc) {
+		dev_err(hdev->dev, "Failed to init NIC driver\n");
+		rc = 0;
+		goto out_disabled;
+	}
+
 	/*
 	 * Expose devices and sysfs nodes to user.
 	 * From here there is no need to add char devices and create sysfs nodes
@@ -1468,6 +1481,11 @@ void hl_device_fini(struct hl_device *hdev)
 		dev_crit(hdev->dev, "Failed to kill all open processes\n");
 
 	hl_cb_pool_fini(hdev);
+
+	/* the NIC uses the kernel context for MMU mappings, therefore must be
+	 * cleaned before it
+	 */
+	hdev->asic_funcs->nic_fini(hdev);
 
 	/* Release kernel context */
 	if ((hdev->kernel_ctx) && (hl_ctx_put(hdev->kernel_ctx) != 1))

@@ -438,6 +438,7 @@ struct gaudi_internal_qman_info {
  * @cpucp_info_get: get information on device from CPU-CP
  * @nic_handle_rx: NIC handler for incoming packet.
  * @nic_handle_tx: NIC handler for outgoing packet.
+ * @nic_spmu_init: initialize NIC CoreSight spmu counters.
  * @nic_devices: array that holds all NIC ports manage structures.
  * @nic_macros: array that holds all NIC macros manage structures.
  * @nic_pam4_tx_taps: array that holds all PAM4 Tx taps of all NIC lanes.
@@ -502,6 +503,7 @@ struct gaudi_device {
 	int (*cpucp_info_get)(struct hl_device *hdev);
 	void (*nic_handle_rx)(struct gaudi_nic_device *gaudi_nic);
 	int (*nic_handle_tx)(struct gaudi_nic_device *gaudi_nic, void *data);
+	void (*nic_spmu_init)(struct hl_device *hdev, int port);
 	struct gaudi_nic_device		nic_devices[NIC_NUMBER_OF_PORTS];
 	struct gaudi_nic_macro		nic_macros[NIC_NUMBER_OF_MACROS];
 	struct gaudi_nic_tx_taps	nic_pam4_tx_taps[NIC_MAX_NUM_OF_LANES];
@@ -576,8 +578,13 @@ irqreturn_t gaudi_nic_rx_irq_handler(int irq, void *arg);
 irqreturn_t gaudi_nic_cq_irq_handler(int irq, void *arg);
 netdev_tx_t gaudi_nic_handle_tx_pkt(struct gaudi_nic_device *gaudi_nic,
 					struct sk_buff *skb);
+void gaudi_nic_spmu_init(struct hl_device *hdev, int port);
 int gaudi_nic_sw_init(struct hl_device *hdev);
 void gaudi_nic_sw_fini(struct hl_device *hdev);
 void gaudi_nic_handle_qp_err(struct hl_device *hdev, u16 event_type);
+int gaudi_config_spmu_nic(struct hl_device *hdev, u32 port,
+		u32 num_event_types, u32 event_types[]);
+int gaudi_sample_spmu_nic(struct hl_device *hdev, u32 port,
+		u32 num_out_data, u64 out_data[]);
 
 #endif /* GAUDIP_H_ */

@@ -3025,6 +3025,8 @@ int gaudi_nic_ports_init(struct hl_device *hdev)
 			}
 		}
 
+	gaudi_nic_debugfs_init(hdev);
+
 	gaudi->hw_cap_initialized |= HW_CAP_NIC_DRV;
 
 	return 0;

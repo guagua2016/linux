@@ -176,3 +176,72 @@ KernelVersion:  5.6
 Contact:        oded.gabbay@gmail.com
 Description:    Sets the stop-on_error option for the device engines. Value of
                 "0" is for disable, otherwise enable.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_mac_loopback
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Allows the root user to disable/enable MAC loopback for Gaudi
+                NIC ports. The ports will function as if a physical loopback
+                transceiver was connected. A bitmask should be provided where
+                each bit represents a port, up to 20 bits.
+                Known issues for this mode:
+                1. Odd ports PHY is not stopped so the peer's odd ports will get
+                PCS link.
+                2. Might cause an interrupt storm due to high B/W.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_ports_status
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Displays a summary the PC link state of all Gaudi NIC ports.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_pcs_fail_time_frame
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Allows the root user to set the used time frame in seconds for
+                detecting a loose PCS link of a Gaudi NIC port. We count how
+                many PCS link failures occurred in a time frame up to a
+                threshold which will cause PHY reconfiguration for getting a new
+                PCS link.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_pcs_fail_threshold
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Allows the root user to set the used threshold for detecting a
+                loose PCS link of a Gaudi NIC port. We count how many PCS link
+                failures occurred in a time frame up to the threshold which will
+                cause PHY reconfiguration for getting a new PCS link.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_pam4_tx_taps
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Allows the root user to set the PAM4 Tx taps for Gaudi NIC port
+                lanes. The lanes indices are 0-39.
+                Acceptable input string form:
+                <lane> <tx_pre2> <tx_pre1> <tx_main> <tx_post1> <tx_post2>.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_polarity
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Allows the root user to set the polarity for Gaudi NIC port
+                lanes. The lanes indices are 0-39.
+                Acceptable input string form: <lane> <pol_tx> <pol_rx>.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_check_link
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Sets the PCS link periodic check for all Gaudi NIC ports. Value
+                of "0" is for disable, otherwise enable.
+
+What:           /sys/kernel/debug/habanalabs/hl<n>/nic_phy_auto_neg_lpbk
+Date:           Nov 2020
+KernelVersion:  5.10
+Contact:        oshpigelman@habana.ai
+Description:    Sets the PHY Autoneg loopback support for all Gaudi NIC ports.
+                Value of "0" is for disable, otherwise enable.

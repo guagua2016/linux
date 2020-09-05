@@ -2779,6 +2779,9 @@ static int port_register(struct hl_device *hdev, int port)
 
 	ndev->netdev_ops = &gaudi_nic_netdev_ops;
 	ndev->ethtool_ops = &gaudi_nic_ethtool_ops;
+#ifdef CONFIG_DCB
+	ndev->dcbnl_ops = &gaudi_nic_dcbnl_ops;
+#endif
 	ndev->watchdog_timeo = NIC_TX_TIMEOUT;
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = NIC_MAX_MTU;

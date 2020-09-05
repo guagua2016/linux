@@ -3,4 +3,4 @@ HL_GAUDI_FILES := gaudi/gaudi.o gaudi/gaudi_hwmgr.o gaudi/gaudi_security.o \
 	gaudi/gaudi_coresight.o
 
 HL_GAUDI_FILES += gaudi/gaudi_nic.o gaudi/gaudi_phy.o \
-	gaudi/gaudi_nic_ethtool.o
+	gaudi/gaudi_nic_ethtool.o gaudi/gaudi_nic_dcbnl.o

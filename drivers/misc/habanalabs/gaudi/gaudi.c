@@ -883,6 +883,27 @@ static void gaudi_late_fini(struct hl_device *hdev)
 	hdev->hl_chip_info->info = NULL;
 }
 
+static int gaudi_nic_init(struct hl_device *hdev)
+{
+	/*
+	 * In init flow we initialize the NIC ports from scratch. In hard reset
+	 * flow, we get here after the NIC ports were halted, hence we only
+	 * need to reopen them.
+	 */
+	if (atomic_read(&hdev->in_reset)) {
+		gaudi_nic_ports_reopen(hdev);
+		return 0;
+	}
+
+	return gaudi_nic_ports_init(hdev);
+}
+
+static void gaudi_nic_fini(struct hl_device *hdev)
+{
+	/* must be called after MSI was disabled */
+	gaudi_nic_ports_fini(hdev);
+}
+
 static void gaudi_nic_handle_rx(struct gaudi_nic_device *gaudi_nic)
 {
 	/* at this point, interrupts were disabled by the H/W */
@@ -7485,6 +7506,8 @@ static const struct hl_asic_funcs gaudi_funcs = {
 	.get_eeprom_data = gaudi_get_eeprom_data,
 	.send_cpu_message = gaudi_send_cpu_message,
 	.get_hw_state = gaudi_get_hw_state,
+	.nic_init = gaudi_nic_init,
+	.nic_fini = gaudi_nic_fini,
 	.nic_control = gaudi_nic_control,
 	.nic_cq_mmap = gaudi_nic_cq_mmap,
 	.pci_bars_map = gaudi_pci_bars_map,

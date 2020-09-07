@@ -852,6 +852,116 @@ struct hl_debug_args {
 #define HL_NIC_MIN_CONN_ID	1
 #define HL_NIC_MAX_CONN_ID	1023
 
+struct hl_nic_alloc_conn_in {
+	/* NIC port ID */
+	__u32 port;
+	__u32 pad;
+};
+
+struct hl_nic_alloc_conn_out {
+	/* Connection ID */
+	__u32 conn_id;
+	__u32 pad;
+};
+
+struct hl_nic_req_conn_ctx_in {
+	/* Source IP address */
+	__u32 src_ip_addr;
+	/* Destination IP address */
+	__u32 dst_ip_addr;
+	/* Destination connection ID */
+	__u32 dst_conn_id;
+	/* Burst size [1..(2^22)-1 or 0 to disable] */
+	__u32 burst_size;
+	/* Index of last entry [2..(2^22)-1] */
+	__u32 last_index;
+	/* NIC port ID */
+	__u32 port;
+	/* Connection ID */
+	__u32 conn_id;
+	/* Destination MAC address */
+	__u8 dst_mac_addr[ETH_ALEN];
+	/* SQ number */
+	__u8 sq_number;
+	/* Connection priority [0..3] */
+	__u8 priority;
+	/* Enable/disable SOB */
+	__u8 enable_sob;
+	/* Timer granularity [0..127]*/
+	__u8 timer_granularity;
+	/* SWQ granularity [0 for 64B or 1 for 32B] */
+	__u8 swq_granularity;
+	/* Work queue type [1..3] */
+	__u8 wq_type;
+	/* Version type in remote side [0..1] */
+	__u8 version;
+	/* Completion queue number */
+	__u8 cq_number;
+	/* Remote Work queue log size [2^QPC] Rendezvous */
+	__u8 wq_remote_log_size;
+	__u8 pad;
+};
+
+struct hl_nic_res_conn_ctx_in {
+	/* Source IP address */
+	__u32 src_ip_addr;
+	/* Destination IP address */
+	__u32 dst_ip_addr;
+	/* Destination connection ID */
+	__u32 dst_conn_id;
+	/* NIC port ID */
+	__u32 port;
+	/* Connection ID */
+	__u32 conn_id;
+	/* Destination MAC address */
+	__u8 dst_mac_addr[ETH_ALEN];
+	/* Connection priority [0..3] */
+	__u8 priority;
+	/* SQ number */
+	__u8 sq_number;
+	/* Enable/disable SOB */
+	__u8 enable_sob;
+	/* Work queue granularity */
+	__u8 wq_peer_granularity;
+	/* Completion queue number */
+	__u8 cq_number;
+	/* Version type in remote side [0..1] */
+	__u8 version;
+	/* Connection peer */
+	__u32 conn_peer;
+};
+
+struct hl_nic_destroy_conn_in {
+	/* NIC port ID */
+	__u32 port;
+	/* Connection ID */
+	__u32 conn_id;
+};
+
+/* Opcode to allocate connection ID */
+#define HL_NIC_OP_ALLOC_CONN			0
+/* Opcode to set up a requester connection context */
+#define HL_NIC_OP_SET_REQ_CONN_CTX		1
+/* Opcode to set up a responder connection context */
+#define HL_NIC_OP_SET_RES_CONN_CTX		2
+/* Opcode to destroy a connection */
+#define HL_NIC_OP_DESTROY_CONN			3
+
+struct hl_nic_args {
+	/* Pointer to user input structure (relevant to specific opcodes) */
+	__u64 input_ptr;
+	/* Pointer to user output structure (relevant to specific opcodes) */
+	__u64 output_ptr;
+	/* Size of user input structure */
+	__u32 input_size;
+	/* Size of user output structure */
+	__u32 output_size;
+	/* Context ID - Currently not in use */
+	__u32 ctx_id;
+	/* HL_NIC_OP_* */
+	__u32 op;
+};
+
 /*
  * Various information operations such as:
  * - H/W IP information
@@ -1017,7 +1127,24 @@ struct hl_debug_args {
 #define HL_IOCTL_DEBUG		\
 		_IOWR('H', 0x06, struct hl_debug_args)
 
+/*
+ * NIC
+ *
+ * This IOCTL allows the user to manage and configure the device's NIC ports.
+ * The following operations are available:
+ * - Allocate connection ID
+ * - Set up a requester connection context
+ * - Set up a responder connection context
+ * - Destroy a connection
+ *
+ * For all operations, the user should provide a pointer to an input structure
+ * with the context parameters. Some of the operations also require a pointer to
+ * an output structure for result/status.
+ *
+ */
+#define HL_IOCTL_NIC	_IOWR('H', 0x07, struct hl_nic_args)
+
 #define HL_COMMAND_START	0x01
-#define HL_COMMAND_END		0x07
+#define HL_COMMAND_END		0x08
 
 #endif /* HABANALABS_H_ */

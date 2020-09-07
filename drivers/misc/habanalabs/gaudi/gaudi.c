@@ -6661,6 +6661,19 @@ static void gaudi_handle_eqe(struct hl_device *hdev,
 		hl_fw_unmask_irq(hdev, event_type);
 		break;
 
+	case GAUDI_EVENT_NIC0_QP0:
+	case GAUDI_EVENT_NIC0_QP1:
+	case GAUDI_EVENT_NIC1_QP0:
+	case GAUDI_EVENT_NIC1_QP1:
+	case GAUDI_EVENT_NIC2_QP0:
+	case GAUDI_EVENT_NIC2_QP1:
+	case GAUDI_EVENT_NIC3_QP0:
+	case GAUDI_EVENT_NIC3_QP1:
+	case GAUDI_EVENT_NIC4_QP0:
+	case GAUDI_EVENT_NIC4_QP1:
+		gaudi_nic_handle_qp_err(hdev, event_type);
+		break;
+
 	case GAUDI_EVENT_PSOC_GPIO_U16_0:
 		cause = le64_to_cpu(eq_entry->data[0]) & 0xFF;
 		dev_err(hdev->dev,

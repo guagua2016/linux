@@ -578,5 +578,6 @@ netdev_tx_t gaudi_nic_handle_tx_pkt(struct gaudi_nic_device *gaudi_nic,
 					struct sk_buff *skb);
 int gaudi_nic_sw_init(struct hl_device *hdev);
 void gaudi_nic_sw_fini(struct hl_device *hdev);
+void gaudi_nic_handle_qp_err(struct hl_device *hdev, u16 event_type);
 
 #endif /* GAUDIP_H_ */

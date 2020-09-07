@@ -29,6 +29,7 @@ static DEFINE_MUTEX(hl_devs_idr_lock);
 
 static int timeout_locked = 5;
 static int reset_on_lockup = 1;
+static int nic_rx_poll;
 
 module_param(timeout_locked, int, 0444);
 MODULE_PARM_DESC(timeout_locked,
@@ -37,6 +38,10 @@ MODULE_PARM_DESC(timeout_locked,
 module_param(reset_on_lockup, int, 0444);
 MODULE_PARM_DESC(reset_on_lockup,
 	"Do device reset on lockup (0 = no, 1 = yes, default yes)");
+
+module_param(nic_rx_poll, int, 0444);
+MODULE_PARM_DESC(nic_rx_poll,
+	"Enable NIC Rx polling mode (0 = no, 1 = yes, default no)");
 
 #define PCI_VENDOR_ID_HABANALABS	0x1da3
 
@@ -241,6 +246,10 @@ static void set_driver_behavior_per_device(struct hl_device *hdev)
 	hdev->dram_scrambler_enable = 1;
 	hdev->bmc_enable = 1;
 	hdev->hard_reset_on_fw_events = 1;
+	hdev->card_type = cpucp_card_type_pci;
+	hdev->nic_ports_ext_mask = 0x3FF;
+	hdev->nic_auto_neg_mask = 0x3FF;
+	hdev->nic_load_fw = 0;
 }
 
 /*
@@ -283,6 +292,7 @@ int create_hdev(struct hl_device **dev, struct pci_dev *pdev,
 
 	hdev->major = hl_major;
 	hdev->reset_on_lockup = reset_on_lockup;
+	hdev->nic_rx_poll = nic_rx_poll;
 	hdev->pldm = 0;
 
 	set_driver_behavior_per_device(hdev);

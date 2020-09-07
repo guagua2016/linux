@@ -2774,6 +2774,33 @@ void gaudi_nic_ports_reopen(struct hl_device *hdev)
 	gaudi->hw_cap_initialized |= HW_CAP_NIC_DRV;
 }
 
+int gaudi_nic_get_mac_addr(struct hl_device *hdev,
+				struct hl_info_mac_addr *mac_addr)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct net_device *ndev;
+	int i, number_of_ports;
+
+	if (!(gaudi->hw_cap_initialized & HW_CAP_NIC_DRV))
+		goto out;
+
+	number_of_ports = min_t(int, NIC_NUMBER_OF_PORTS,
+				HL_INFO_MAC_ADDR_MAX_NUM);
+
+	for (i = 0 ; i < number_of_ports ; i++) {
+		if (!(hdev->nic_ports_mask & BIT(i)))
+			continue;
+
+		ndev = gaudi->nic_devices[i].ndev;
+		if (!ndev)
+			continue;
+
+		ether_addr_copy(mac_addr->array[i].addr, ndev->dev_addr);
+		mac_addr->mask[i / 64] |= BIT_ULL(i % 64);
+	}
+out:
+	return 0;
+}
 void gaudi_nic_ctx_fini(struct hl_ctx *ctx)
 {
 }

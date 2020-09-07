@@ -203,6 +203,33 @@ out:
 	return rc;
 }
 
+static int mac_addr_info(struct hl_device *hdev, struct hl_info_args *args)
+{
+	void __user *out = (void __user *) (uintptr_t) args->return_pointer;
+	struct hl_info_mac_addr *mac_addr;
+	u32 max_size = args->return_size;
+	int rc;
+
+	if (!max_size || !out)
+		return -EINVAL;
+
+	mac_addr = kzalloc(sizeof(struct hl_info_mac_addr), GFP_KERNEL);
+	if (!mac_addr)
+		return -ENOMEM;
+
+	rc = hdev->asic_funcs->get_mac_addr(hdev, mac_addr);
+	if (rc)
+		goto out;
+
+	rc = copy_to_user(out, mac_addr,
+		min((size_t) max_size, sizeof(struct hl_info_mac_addr))) ?
+								-EFAULT : 0;
+
+out:
+	kfree(mac_addr);
+	return rc;
+}
+
 static int device_utilization(struct hl_device *hdev, struct hl_info_args *args)
 {
 	struct hl_info_device_utilization device_util = {0};
@@ -421,6 +448,10 @@ static int _hl_info_ioctl(struct hl_fpriv *hpriv, void *data,
 
 	case HL_INFO_HW_IDLE:
 		rc = hw_idle(hdev, args);
+		break;
+
+	case HL_INFO_MAC_ADDR:
+		rc = mac_addr_info(hdev, args);
 		break;
 
 	case HL_INFO_DEVICE_UTILIZATION:

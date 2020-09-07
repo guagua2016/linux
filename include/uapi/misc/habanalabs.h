@@ -852,6 +852,46 @@ struct hl_debug_args {
 #define HL_NIC_MIN_CONN_ID	1
 #define HL_NIC_MAX_CONN_ID	1023
 
+/* Requester */
+#define HL_NIC_CQE_TYPE_REQ	0
+/* Responder */
+#define HL_NIC_CQE_TYPE_RES	1
+
+/**
+ * struct hl_nic_cqe: NIC CQ entry. This structure is shared between the driver
+ *                    and the user application. It represents each entry of the
+ *                    NIC CQ buffer.
+ * @requester.wqe_index: work queue index - for requester only.
+ * @responder.msg_id: message ID to notify which receive action was completed -
+ *                    for responder only.
+ * @qp_err.syndrome: error syndrome of the QP error - for QP error only.
+ * @port: NIC port index of the related CQ.
+ * @qp_number: QP number - for requester or QP error only.
+ * @type: type of the CQE - requester or responder.
+ * @is_err: true for QP error entry, false otherwise.
+ */
+struct hl_nic_cqe {
+	union {
+		struct {
+			__u32 wqe_index;
+		} requester;
+
+		struct {
+			__u32 msg_id;
+		} responder;
+
+		struct {
+			__u32 syndrome;
+		} qp_err;
+	};
+
+	__u32 port;
+	__u32 qp_number;
+	__u8 type;
+	__u8 is_err;
+	__u8 pad[2];
+};
+
 struct hl_nic_alloc_conn_in {
 	/* NIC port ID */
 	__u32 port;
@@ -938,6 +978,53 @@ struct hl_nic_destroy_conn_in {
 	__u32 conn_id;
 };
 
+struct hl_nic_cq_create_in {
+	/* Number of entries in the CQ buffer */
+	__u32 cq_num_of_entries;
+	__u32 pad;
+};
+
+struct hl_nic_cq_create_out {
+	/* Handle of the CQ buffer */
+	__u64 handle;
+};
+
+struct hl_nic_cq_destroy_in {
+	/* Handle of the CQ buffer */
+	__u64 handle;
+};
+
+struct hl_nic_cq_update_consumed_cqes_in {
+	/* Handle of the CQ buffer */
+	__u64 handle;
+	/* Number of consumed CQEs */
+	__u32 cq_num_of_consumed_entries;
+	__u32 pad;
+};
+
+struct hl_nic_cq_poll_wait_in {
+	/* Handle of the CQ buffer */
+	__u64 handle;
+	/* Absolute timeout to wait in microseconds */
+	__u64 timeout_us;
+};
+
+enum hl_nic_cq_status {
+	HL_NIC_CQ_SUCCESS,
+	HL_NIC_CQ_TIMEOUT,
+	HL_NIC_CQ_OVERFLOW
+};
+
+struct hl_nic_cq_poll_wait_out {
+	/* CQE producer index - first CQE to consume */
+	__u32 pi;
+	/* Number of CQEs to consume, starting from pi */
+	__u32 num_of_cqes;
+	/* Return status */
+	__u32 status;
+	__u32 pad;
+};
+
 /* Opcode to allocate connection ID */
 #define HL_NIC_OP_ALLOC_CONN			0
 /* Opcode to set up a requester connection context */
@@ -946,6 +1033,16 @@ struct hl_nic_destroy_conn_in {
 #define HL_NIC_OP_SET_RES_CONN_CTX		2
 /* Opcode to destroy a connection */
 #define HL_NIC_OP_DESTROY_CONN			3
+/* Opcode to create a CQ */
+#define HL_NIC_OP_CQ_CREATE			4
+/* Opcode to destroy a CQ */
+#define HL_NIC_OP_CQ_DESTROY			5
+/* Opcode to wait on CQ */
+#define HL_NIC_OP_CQ_WAIT			6
+/* Opcode to poll on CQ */
+#define HL_NIC_OP_CQ_POLL			7
+/* Opcode to update the number of consumed CQ entries */
+#define HL_NIC_OP_CQ_UPDATE_CONSUMED_CQES	8
 
 struct hl_nic_args {
 	/* Pointer to user input structure (relevant to specific opcodes) */
@@ -1136,10 +1233,24 @@ struct hl_nic_args {
  * - Set up a requester connection context
  * - Set up a responder connection context
  * - Destroy a connection
+ * - Create a completion queue
+ * - Destroy a completion queue
+ * - Wait on completion queue
+ * - Poll a completion queue
+ * - Update consumed completion queue entries
  *
  * For all operations, the user should provide a pointer to an input structure
  * with the context parameters. Some of the operations also require a pointer to
  * an output structure for result/status.
+ * The CQ create operation returns a handle which the user-space process needs
+ * to use to mmap the CQ buffer in order to access the CQ entries.
+ * This handle should be provided when destroying the CQ.
+ * The poll/wait CQ operations return the number of available CQ entries of type
+ * struct hl_nic_cqe.
+ * Since the CQ is a cyclic buffer, the user-space process needs to inform the
+ * driver regarding how many of the available CQEs were actually
+ * processed/consumed. Only then the driver will override them with newer
+ * entries.
  *
  */
 #define HL_IOCTL_NIC	_IOWR('H', 0x07, struct hl_nic_args)

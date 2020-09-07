@@ -1757,6 +1757,466 @@ void gaudi_nic_sw_fini(struct hl_device *hdev)
 		_gaudi_nic_sw_fini(&gaudi->nic_devices[i]);
 }
 
+/* this function is called from multiple threads */
+static void copy_cqe_to_main_queue(struct hl_device *hdev,
+					struct hl_nic_cqe *cqe)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	u32 pi;
+
+	spin_lock(&gaudi->nic_cq_lock);
+
+	pi = gaudi->nic_cq_user_pi++;
+	/* wraparound according to the user CQ length */
+	pi &= (gaudi->nic_cq_user_num_of_entries - 1);
+	memcpy(&gaudi->nic_cq_buf[pi], cqe, sizeof(*cqe));
+
+#if HL_NIC_DEBUG
+	if (cqe->type == HL_NIC_CQE_TYPE_RES) {
+		dev_dbg(hdev->dev,
+			"responder, msg_id: 0x%x, port: %d, was copied to pi %d\n",
+			cqe->responder.msg_id, cqe->port, pi);
+	} else {
+		dev_dbg(hdev->dev,
+			"requester, wqe_index: 0x%x, qp_number: %d, port: %d, was copied to pi %d\n",
+			cqe->requester.wqe_index,
+			cqe->qp_number, cqe->port, pi);
+	}
+#endif
+
+	/* copy the CQE before the counter update */
+	mb();
+
+	if (unlikely(!atomic_add_unless(&gaudi->nic_cq_user_new_cqes, 1,
+				gaudi->nic_cq_user_num_of_entries))) {
+		gaudi->nic_cq_status = HL_NIC_CQ_OVERFLOW;
+		dev_err(hdev->dev, "NIC CQ overflow, should recreate NIC CQ\n");
+	}
+
+	spin_unlock(&gaudi->nic_cq_lock);
+}
+
+static void cq_work(struct work_struct *work)
+{
+	struct gaudi_nic_device *gaudi_nic = container_of(work,
+							struct gaudi_nic_device,
+							cq_work.work);
+	u32 ci = gaudi_nic->cq_ci, cqe_cnt = 0, port = gaudi_nic->port, delay;
+	struct gaudi_device *gaudi = gaudi_nic->hdev->asic_specific;
+	struct cqe *cq_arr = gaudi_nic->cq_mem_cpu, *cqe_hw;
+	struct hl_device *hdev = gaudi_nic->hdev;
+	struct hl_nic_cqe cqe_sw;
+	bool stop_work = false;
+
+	while (1) {
+		if (unlikely(!gaudi->nic_cq_enable) ||
+			unlikely(gaudi->nic_cq_status != HL_NIC_CQ_SUCCESS)) {
+			stop_work = true;
+			break;
+		}
+
+		memset(&cqe_sw, 0, sizeof(cqe_sw));
+
+		/* wraparound according to our buffer length */
+		cqe_hw = &cq_arr[ci & (CQ_PORT_BUF_LEN - 1)];
+
+		if (!CQE_IS_VALID(cqe_hw))
+			break;
+		/* Make sure we read CQE contents after the valid bit check */
+		dma_rmb();
+
+		cqe_sw.port = port;
+
+		if (CQE_TYPE(cqe_hw)) {
+			cqe_sw.type = HL_NIC_CQE_TYPE_RES;
+			cqe_sw.responder.msg_id =
+					(CQE_RES_IMDT_31_22(cqe_hw) << 22) |
+						CQE_RES_IMDT_21_0(cqe_hw);
+
+			/*
+			 * the even port publishes its responder CQEs on the odd
+			 * port CQ. take the correct port in this case.
+			 */
+			if (!CQE_RES_NIC(cqe_hw))
+				cqe_sw.port--;
+		} else {
+			cqe_sw.requester.wqe_index = CQE_REQ_WQE_IDX(cqe_hw);
+			cqe_sw.qp_number = CQE_REQ_QPN(cqe_hw);
+		}
+
+		copy_cqe_to_main_queue(hdev, &cqe_sw);
+
+		CQE_SET_INVALID(cqe_hw);
+
+		/* the H/W CI does wraparound every 32 bit */
+		ci++;
+
+		cqe_cnt++;
+		if (unlikely(cqe_cnt > CQ_PORT_BUF_LEN)) {
+			dev_err(hdev->dev,
+				"handled too many CQEs (%d), port: %d\n",
+				cqe_cnt, port);
+			stop_work = true;
+			break;
+		}
+	}
+
+	/* no CQEs to handle */
+	if (cqe_cnt == 0)
+		goto out;
+
+#if HL_NIC_DEBUG
+	dev_dbg(hdev->dev, "update H/W CQ CI: %d, port: %d\n", ci, port);
+#endif
+
+	NIC_WREG32(mmNIC0_RXE0_CQ_CONSUMER_INDEX, ci);
+
+	/*
+	 * perform a read to flush the new CI value before checking for hidden
+	 * packets
+	 */
+	NIC_RREG32(mmNIC0_RXE0_CQ_CONSUMER_INDEX);
+
+	gaudi_nic->cq_ci = ci;
+
+	/* make sure we wake up the waiter after the CI update */
+	mb();
+
+	/* signal the completion queue that there are available CQEs */
+	complete(&gaudi->nic_cq_comp);
+
+	if (unlikely(stop_work))
+		goto out;
+
+out:
+	if (likely(cqe_cnt)) {
+		gaudi_nic->last_cqe_cnt = cqe_cnt;
+		delay = gaudi_nic->cq_delay;
+	} else {
+		ktime_t later;
+
+		/*
+		 * take base TS on the first polling invocation where no CQEs
+		 * were processed
+		 */
+		if (gaudi_nic->last_cqe_cnt) {
+			gaudi_nic->last_cqe_cnt = 0;
+			gaudi_nic->last_cqe_ts = ktime_get();
+		}
+
+		/* extend the delay if no CQEs were processed for 1 sec */
+		later = ktime_add_ms(gaudi_nic->last_cqe_ts, 1 * MSEC_PER_SEC);
+		if (ktime_compare(ktime_get(), later) > 0)
+			delay = gaudi_nic->cq_delay_idle;
+		else
+			delay = gaudi_nic->cq_delay;
+	}
+
+	queue_delayed_work(gaudi_nic->cq_wq, &gaudi_nic->cq_work, delay);
+}
+
+static int cq_update_consumed_cqes(struct hl_device *hdev,
+				struct hl_nic_cq_update_consumed_cqes_in *in)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	u32 num_of_cqes;
+	int rc = 0;
+
+	if (!in) {
+		dev_err(hdev->dev,
+			"Missing parameters to update consumed CQEs\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&gaudi->nic_cq_user_lock);
+
+	if (!gaudi->nic_cq_enable) {
+		dev_err(hdev->dev,
+			"NIC CQ is not enabled, can't update user CI\n");
+		rc = -EFAULT;
+		goto out;
+	}
+
+	num_of_cqes = in->cq_num_of_consumed_entries;
+
+	if (atomic_read(&gaudi->nic_cq_user_new_cqes) < num_of_cqes) {
+		dev_err(hdev->dev,
+			"nunmber of consumed CQEs is too big %d/%d\n",
+			num_of_cqes, atomic_read(&gaudi->nic_cq_user_new_cqes));
+		rc = -EINVAL;
+		goto out;
+	}
+
+	gaudi->nic_cq_user_ci = (gaudi->nic_cq_user_ci + num_of_cqes) &
+				(gaudi->nic_cq_user_num_of_entries - 1);
+
+	atomic_sub(num_of_cqes, &gaudi->nic_cq_user_new_cqes);
+
+#if HL_NIC_DEBUG
+	dev_dbg(hdev->dev, "consumed %d CQEs\n", num_of_cqes);
+	dev_dbg(hdev->dev, "user CQ CI: %d\n", gaudi->nic_cq_user_ci);
+#endif
+out:
+	mutex_unlock(&gaudi->nic_cq_user_lock);
+
+	return rc;
+}
+
+static int cq_poll_wait(struct hl_device *hdev,
+			struct hl_nic_cq_poll_wait_in *in,
+			struct hl_nic_cq_poll_wait_out *out,
+			bool do_wait)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	char *op_str = do_wait ? "wait" : "poll";
+	bool has_work = false;
+	u32 num_of_cqes;
+	long rc_wait;
+	int rc = 0;
+
+	if (!in || !out) {
+		dev_err(hdev->dev, "Missing parameters to poll/wait on CQ\n");
+		return -EINVAL;
+	}
+
+	/* allow only one thread to wait */
+	mutex_lock(&gaudi->nic_cq_user_lock);
+
+	if (!gaudi->nic_cq_enable) {
+		dev_err(hdev->dev, "NIC CQ is not enabled, can't %s\n", op_str);
+		rc = -EFAULT;
+		goto out;
+	}
+
+	if (gaudi->nic_cq_status != HL_NIC_CQ_SUCCESS) {
+		dev_err(hdev->dev, "NIC CQ is not operational, can't %s\n",
+			op_str);
+		rc = -EFAULT;
+		goto out;
+	}
+
+#if HL_NIC_DEBUG
+	dev_dbg(hdev->dev, "ci: %d, wait: %d\n",
+		gaudi->nic_cq_user_ci, do_wait);
+#endif
+
+	if (do_wait) {
+		while (1) {
+			rc_wait = wait_for_completion_interruptible_timeout(
+					&gaudi->nic_cq_comp,
+					usecs_to_jiffies(in->timeout_us));
+
+			if (rc_wait == -ERESTARTSYS) {
+				dev_info(hdev->dev,
+						"stopping CQ %s due to signal\n",
+						op_str);
+				/* ERESTARTSYS is not returned to the user */
+				rc = -EINTR;
+				break;
+			}
+
+			if (!rc_wait) {
+				gaudi->nic_cq_status = HL_NIC_CQ_TIMEOUT;
+				break;
+			}
+
+			if (!gaudi->nic_cq_enable) {
+				dev_info(hdev->dev,
+						"stopping CQ %s upon request\n",
+						op_str);
+				rc = -EBUSY;
+				break;
+			}
+
+			if (gaudi->nic_cq_status != HL_NIC_CQ_SUCCESS)
+				break;
+
+			/*
+			 * A waiter can read 0 here.
+			 * Consider the following scenario:
+			 * 1. complete() is called twice for two CQEs.
+			 * 2. The first waiter grabs the two CQEs.
+			 * 3. The second waiter wakes up immediately and has no
+			 *    CQES to handle.
+			 */
+			num_of_cqes = atomic_read(&gaudi->nic_cq_user_new_cqes);
+			if (num_of_cqes) {
+				has_work = true;
+				break;
+			}
+		}
+	} else {
+		has_work = try_wait_for_completion(&gaudi->nic_cq_comp);
+		if (has_work)
+			num_of_cqes = atomic_read(&gaudi->nic_cq_user_new_cqes);
+	}
+
+	if (rc)
+		goto out;
+
+	if (has_work) {
+		out->pi = gaudi->nic_cq_user_ci;
+		out->num_of_cqes = num_of_cqes;
+#if HL_NIC_DEBUG
+		dev_dbg(hdev->dev, "pulled %d CQEs\n", num_of_cqes);
+		dev_dbg(hdev->dev, "user CQ CI: %d\n", gaudi->nic_cq_user_ci);
+#endif
+	} else {
+		out->num_of_cqes = 0;
+	}
+
+	out->status = gaudi->nic_cq_status;
+
+	/* timeout is not a real error, CQ should stay operational */
+	if (gaudi->nic_cq_status == HL_NIC_CQ_TIMEOUT)
+		gaudi->nic_cq_status = HL_NIC_CQ_SUCCESS;
+out:
+	mutex_unlock(&gaudi->nic_cq_user_lock);
+
+	return rc;
+}
+
+static int cq_create(struct hl_device *hdev, struct hl_nic_cq_create_in *in,
+			struct hl_nic_cq_create_out *out)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct cqe *cq_arr;
+	int rc = 0, i, j;
+
+	if (!in || !out) {
+		dev_err(hdev->dev, "Missing parameters to create CQ\n");
+		return -EINVAL;
+	}
+
+	if (in->cq_num_of_entries < CQ_USER_MIN_ENTRIES) {
+		dev_err(hdev->dev, "NIC CQ buffer length must be at least %d entries\n",
+			CQ_USER_MIN_ENTRIES);
+		return -EINVAL;
+	}
+
+	if (!is_power_of_2(in->cq_num_of_entries)) {
+		dev_err(hdev->dev,
+			"NIC CQ buffer length must be at power of 2\n");
+		return -EINVAL;
+	}
+
+	if (in->cq_num_of_entries > CQ_USER_MAX_ENTRIES) {
+		dev_err(hdev->dev,
+			"NIC CQ buffer length must not be more than 0x%lx entries\n",
+			CQ_USER_MAX_ENTRIES);
+		return -EINVAL;
+	}
+
+	mutex_lock(&gaudi->nic_cq_user_lock);
+
+	if (gaudi->nic_cq_enable) {
+		dev_err(hdev->dev, "NIC CQ was already created\n");
+		rc = -EFAULT;
+		goto out;
+	}
+
+	gaudi->nic_cq_user_num_of_entries = in->cq_num_of_entries;
+	gaudi->nic_cq_buf = vmalloc_user(gaudi->nic_cq_user_num_of_entries *
+					sizeof(struct hl_nic_cqe));
+	if (!gaudi->nic_cq_buf) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	init_completion(&gaudi->nic_cq_comp);
+	memset(gaudi->nic_cq_buf, 0,
+		gaudi->nic_cq_user_num_of_entries * sizeof(struct hl_nic_cqe));
+
+	spin_lock_init(&gaudi->nic_cq_lock);
+	gaudi->nic_cq_user_ci = 0;
+	gaudi->nic_cq_user_pi = 0;
+	atomic_set(&gaudi->nic_cq_user_new_cqes, 0);
+
+	for (i = 0 ; i < NIC_NUMBER_OF_PORTS ; i++) {
+		if (!(hdev->nic_ports_mask & BIT(i)) ||
+			!gaudi->nic_devices[i].port_open)
+			continue;
+
+		gaudi_nic = &gaudi->nic_devices[i];
+		gaudi_nic->cq_ci = gaudi_nic->last_cqe_cnt = 0;
+
+		NIC_WREG32(mmNIC0_RXE0_CQ_PRODUCER_INDEX, 0);
+		NIC_WREG32(mmNIC0_RXE0_CQ_CONSUMER_INDEX, 0);
+		NIC_WREG32(mmNIC0_RXE0_CQ_WRITE_INDEX, 0);
+
+		cq_arr = gaudi_nic->cq_mem_cpu;
+		for (j = 0 ; j < CQ_PORT_BUF_LEN ; j++)
+			CQE_SET_INVALID(&cq_arr[j]);
+
+	}
+
+	out->handle = HL_MMAP_TYPE_NIC_CQ << PAGE_SHIFT;
+	gaudi->nic_cq_status = HL_NIC_CQ_SUCCESS;
+	gaudi->nic_cq_enable = true;
+out:
+	mutex_unlock(&gaudi->nic_cq_user_lock);
+
+	return rc;
+}
+
+static void cq_stop(struct hl_device *hdev)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+
+	if (!gaudi->nic_cq_enable)
+		return;
+
+	/* if the CQ wait IOCTL is in progress, wake it up to return to US */
+	gaudi->nic_cq_enable = false;
+	/* make sure we disable the CQ before waking up the waiter */
+	mb();
+	complete(&gaudi->nic_cq_comp);
+
+	/* let the CQ wait IOCTL do cleanup gracefully */
+	msleep(100);
+}
+
+static int cq_destroy(struct hl_device *hdev)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	int rc = 0;
+
+	mutex_lock(&gaudi->nic_cq_user_lock);
+
+	if (!gaudi->nic_cq_enable)
+		goto out;
+
+	if (gaudi->nic_cq_mmap) {
+		dev_err(hdev->dev, "NIC CQ is still mapped, can't destroy\n");
+		rc = -EFAULT;
+		goto out;
+	}
+
+	/*
+	 * mark the CQ as disabled while holding the NIC QP error lock to avoid
+	 * from pushing QP error entries to a CQ under destruction
+	 */
+	mutex_lock(&gaudi->nic_qp_err_lock);
+	gaudi->nic_cq_enable = false;
+	mutex_unlock(&gaudi->nic_qp_err_lock);
+
+	/* make sure we disable the CQ before draining the polling threads */
+	mb();
+
+	/*
+	 * Wait for the polling threads to digest the new CQ state. This in
+	 * order to free the user buffer after they stopped processing CQEs and
+	 * copy them to the buffer.
+	 */
+	msleep(100);
+
+	vfree(gaudi->nic_cq_buf);
+out:
+	mutex_unlock(&gaudi->nic_cq_user_lock);
+
+	return rc;
+}
 
 /* used for physically contiguous memory only */
 static int map_nic_mem(struct hl_device *hdev, u64 va, dma_addr_t pa, u32 size)
@@ -1956,6 +2416,8 @@ static int port_open(struct gaudi_nic_device *gaudi_nic)
 		goto cq_unmap;
 	}
 
+	INIT_DELAYED_WORK(&gaudi_nic->cq_work, cq_work);
+
 	if ((hdev->pdev) && (gaudi->multi_msi_mode)) {
 		rx_irq = pci_irq_vector(hdev->pdev, RX_MSI_IDX + port);
 
@@ -1997,6 +2459,9 @@ static int port_open(struct gaudi_nic_device *gaudi_nic)
 	} else {
 		napi_enable(&gaudi_nic->napi);
 	}
+
+	queue_delayed_work(gaudi_nic->cq_wq, &gaudi_nic->cq_work,
+				gaudi_nic->cq_delay_idle);
 
 	if (gaudi->nic_phy_config_fw && !gaudi_nic->mac_loopback) {
 		INIT_DELAYED_WORK(&gaudi_nic->link_status_work,
@@ -2097,6 +2562,8 @@ static void port_close(struct gaudi_nic_device *gaudi_nic)
 	}
 
 	netif_carrier_off(gaudi_nic->ndev);
+
+	cancel_delayed_work_sync(&gaudi_nic->cq_work);
 
 	flush_workqueue(gaudi_nic->cq_wq);
 	destroy_workqueue(gaudi_nic->cq_wq);
@@ -2362,6 +2829,33 @@ static void port_unregister(struct gaudi_nic_device *gaudi_nic)
 
 irqreturn_t gaudi_nic_cq_irq_handler(int irq, void *arg)
 {
+	struct gaudi_nic_device *gaudi_nic;
+	struct hl_device *hdev = arg;
+	struct gaudi_device *gaudi;
+	int i;
+
+	gaudi = hdev->asic_specific;
+
+	/* one IRQ for all ports, need to iterate and read the cause */
+	for (i = 0 ; i < NIC_NUMBER_OF_PORTS ; i++) {
+		if (!(hdev->nic_ports_mask & BIT(i)))
+			continue;
+
+		gaudi_nic = &gaudi->nic_devices[i];
+
+		if (disabled_or_in_reset(gaudi_nic))
+			continue;
+
+		if (NIC_RREG32(mmNIC0_RXE0_MSI_CAUSE) & 2) {
+			dev_crit(hdev->dev, "NIC CQ overrun, port %d\n",
+					gaudi_nic->port);
+			NIC_WREG32(mmNIC0_RXE0_MSI_CAUSE, 0);
+			NIC_WREG32(mmNIC0_RXE0_CQ_MSI_CAUSE_CLR, 0xFFFF);
+			/* flush the cause clear */
+			NIC_RREG32(mmNIC0_RXE0_CQ_MSI_CAUSE_CLR);
+		}
+	}
+
 	return IRQ_HANDLED;
 }
 
@@ -2640,6 +3134,8 @@ int gaudi_nic_hard_reset_prepare(struct hl_device *hdev)
 	if (!(gaudi->hw_cap_initialized & HW_CAP_NIC_DRV) ||
 			(gaudi->nic_in_reset))
 		return 0;
+
+	cq_stop(hdev);
 
 	for (i = 0 ; i < NIC_NUMBER_OF_PORTS ; i++) {
 		if (!(hdev->nic_ports_mask & BIT(i)))
@@ -3159,6 +3655,21 @@ int gaudi_nic_control(struct hl_device *hdev, u32 op, void *input, void *output)
 	case HL_NIC_OP_DESTROY_CONN:
 		rc = destroy_conn(hdev, input);
 		break;
+	case HL_NIC_OP_CQ_CREATE:
+		rc = cq_create(hdev, input, output);
+		break;
+	case HL_NIC_OP_CQ_DESTROY:
+		rc = cq_destroy(hdev);
+		break;
+	case HL_NIC_OP_CQ_WAIT:
+		rc = cq_poll_wait(hdev, input, output, true);
+		break;
+	case HL_NIC_OP_CQ_POLL:
+		rc = cq_poll_wait(hdev, input, output, false);
+		break;
+	case HL_NIC_OP_CQ_UPDATE_CONSUMED_CQES:
+		rc = cq_update_consumed_cqes(hdev, input);
+		break;
 	default:
 		dev_err(hdev->dev, "Invalid NIC control request %d\n", op);
 		return -ENOTTY;
@@ -3209,4 +3720,87 @@ void gaudi_nic_ctx_fini(struct hl_ctx *ctx)
 	qps_destroy(hdev);
 	/* wait for the NIC to digest the invalid QPs */
 	msleep(20);
+	cq_destroy(hdev);
+}
+
+static void nic_cq_vm_close(struct vm_area_struct *vma)
+{
+	struct hl_device *hdev = (struct hl_device *) vma->vm_private_data;
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	long new_mmap_size;
+
+	new_mmap_size = gaudi->nic_cq_mmap_size - (vma->vm_end - vma->vm_start);
+
+	dev_dbg(hdev->dev, "munmap NIC CQEs buffer, new_mmap_size: %ld\n",
+		new_mmap_size);
+
+	if (new_mmap_size > 0) {
+		gaudi->nic_cq_mmap_size = new_mmap_size;
+		return;
+	}
+
+	vma->vm_private_data = NULL;
+	gaudi->nic_cq_mmap = false;
+}
+
+static const struct vm_operations_struct nic_cq_vm_ops = {
+	.close = nic_cq_vm_close
+};
+
+int gaudi_nic_cq_mmap(struct hl_device *hdev, struct vm_area_struct *vma)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	u32 size;
+	int rc;
+
+	if (!(gaudi->hw_cap_initialized & HW_CAP_NIC_DRV))
+		return -EFAULT;
+
+	mutex_lock(&gaudi->nic_cq_user_lock);
+
+	if (!gaudi->nic_cq_enable) {
+		dev_err(hdev->dev, "NIC CQ is disabled, can't mmap\n");
+		rc = -EFAULT;
+		goto out;
+	}
+
+	if (gaudi->nic_cq_mmap) {
+		dev_err(hdev->dev, "NIC CQ is already mmapped, can't mmap\n");
+		rc = -EFAULT;
+		goto out;
+	}
+
+	size = gaudi->nic_cq_user_num_of_entries * sizeof(struct hl_nic_cqe);
+
+	dev_dbg(hdev->dev, "mmap NIC CQ buffer, size: 0x%x\n", size);
+
+	/* Validation check */
+	if ((vma->vm_end - vma->vm_start) != ALIGN(size, PAGE_SIZE)) {
+		dev_err(hdev->dev,
+			"NIC mmap failed, mmap size 0x%lx != 0x%x CQ buffer size\n",
+			vma->vm_end - vma->vm_start, size);
+		rc = -EINVAL;
+		goto out;
+	}
+
+	vma->vm_ops = &nic_cq_vm_ops;
+	vma->vm_private_data = hdev;
+
+	dev_dbg(hdev->dev, "mapping NIC CQ buffer\n");
+
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY |
+			VM_NORESERVE;
+
+	rc = remap_vmalloc_range(vma, gaudi->nic_cq_buf, 0);
+	if (rc) {
+		dev_err(hdev->dev, "failed to map the NIC CQ buffer\n");
+		goto out;
+	}
+
+	gaudi->nic_cq_mmap_size = size;
+	gaudi->nic_cq_mmap = true;
+out:
+	mutex_unlock(&gaudi->nic_cq_user_lock);
+
+	return rc;
 }

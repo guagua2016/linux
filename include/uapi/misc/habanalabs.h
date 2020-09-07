@@ -1025,6 +1025,31 @@ struct hl_nic_cq_poll_wait_out {
 	__u32 pad;
 };
 
+/* Send user WQ array type */
+#define HL_NIC_USER_WQ_SEND	0
+/* Receive user WQ array type */
+#define HL_NIC_USER_WQ_RECV	1
+
+struct hl_nic_user_wq_arr_set_in {
+	/* WQ array address */
+	__u64 addr;
+	/* NIC port ID */
+	__u32 port;
+	/* Number of user WQs */
+	__u32 num_of_wqs;
+	/* Number of entries per user WQ */
+	__u32 num_of_wq_entries;
+	/* Type of user WQ array */
+	__u32 type;
+};
+
+struct hl_nic_user_wq_arr_unset_in {
+	/* NIC port ID */
+	__u32 port;
+	/* Type of user WQ array */
+	__u32 type;
+};
+
 /* Opcode to allocate connection ID */
 #define HL_NIC_OP_ALLOC_CONN			0
 /* Opcode to set up a requester connection context */
@@ -1043,6 +1068,10 @@ struct hl_nic_cq_poll_wait_out {
 #define HL_NIC_OP_CQ_POLL			7
 /* Opcode to update the number of consumed CQ entries */
 #define HL_NIC_OP_CQ_UPDATE_CONSUMED_CQES	8
+/* Opcode to set a user WQ array */
+#define HL_NIC_OP_USER_WQ_SET			9
+/* Opcode to unset a user WQ array */
+#define HL_NIC_OP_USER_WQ_UNSET			10
 
 struct hl_nic_args {
 	/* Pointer to user input structure (relevant to specific opcodes) */
@@ -1238,6 +1267,8 @@ struct hl_nic_args {
  * - Wait on completion queue
  * - Poll a completion queue
  * - Update consumed completion queue entries
+ * - Set a work queue
+ * - Unset a work queue
  *
  * For all operations, the user should provide a pointer to an input structure
  * with the context parameters. Some of the operations also require a pointer to
@@ -1251,6 +1282,8 @@ struct hl_nic_args {
  * driver regarding how many of the available CQEs were actually
  * processed/consumed. Only then the driver will override them with newer
  * entries.
+ * The set WQ operation should provide the device virtual address of the WQ with
+ * a matching size for the number of WQs and entries per WQ.
  *
  */
 #define HL_IOCTL_NIC	_IOWR('H', 0x07, struct hl_nic_args)

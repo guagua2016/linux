@@ -3302,6 +3302,170 @@ out:
 	return 0;
 }
 
+static int wq_port_check(struct hl_device *hdev, u32 port)
+{
+	if (port >= NIC_NUMBER_OF_ENGINES) {
+		dev_err(hdev->dev, "Invalid port %d\n", port);
+		return -EINVAL;
+	}
+
+	if (!(hdev->nic_ports_mask & BIT(port))) {
+		dev_err(hdev->dev, "Port %d is disabled\n", port);
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+static int user_wq_arr_set(struct hl_device *hdev,
+				struct hl_nic_user_wq_arr_set_in *in)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	u64 wq_base_addr, num_of_wq_entries_log;
+	struct gaudi_nic_device *gaudi_nic;
+	u32 port, type;
+	int rc;
+
+	if (!in) {
+		dev_err(hdev->dev, "missing parameters, can't set user WQ\n");
+		return -EINVAL;
+	}
+
+	type = in->type;
+	if (type != HL_NIC_USER_WQ_SEND && type != HL_NIC_USER_WQ_RECV) {
+		dev_err(hdev->dev, "invalid type %d, can't set user WQ\n",
+			type);
+		return -EINVAL;
+	}
+
+	port = in->port;
+
+	rc = wq_port_check(hdev, port);
+	if (rc)
+		return rc;
+
+	gaudi_nic = &gaudi->nic_devices[port];
+
+	if (in->num_of_wqs == 0) {
+		dev_err(hdev->dev,
+			"number of WQs must be bigger than zero, port: %d\n",
+			port);
+		return -EINVAL;
+	}
+
+	/* H/W limitation */
+	if (in->num_of_wqs > NIC_HW_MAX_QP_NUM) {
+		dev_err(hdev->dev,
+			"number of WQs (0x%x) can't be bigger than 0x%x, port: %d\n",
+			in->num_of_wqs, NIC_HW_MAX_QP_NUM, port);
+		return -EINVAL;
+	}
+
+	if (!is_power_of_2(in->num_of_wq_entries)) {
+		dev_err(hdev->dev,
+			"number of entries (0x%x) must be a power of 2, port: %d\n",
+			in->num_of_wq_entries, port);
+		return -EINVAL;
+	}
+
+	/* H/W cache line constraint */
+	if (in->num_of_wq_entries < 4) {
+		dev_err(hdev->dev,
+			"number of entries (0x%x) must be at least 4, port: %d\n",
+			in->num_of_wq_entries, port);
+		return -EINVAL;
+	}
+
+	/* H/W limitation */
+	if (in->num_of_wq_entries > USER_WQES_MAX_NUM) {
+		dev_err(hdev->dev,
+			"number of entries (0x%x) can't be bigger than 0x%x, port: %d\n",
+			in->num_of_wq_entries, USER_WQES_MAX_NUM, port);
+		return -EINVAL;
+	}
+
+	if (!IS_ALIGNED(in->addr, DEVICE_CACHE_LINE_SIZE)) {
+		dev_err(hdev->dev,
+			"WQ VA (0x%llx) must be aligned to cache line size (0x%x), port: %d\n",
+			in->addr, DEVICE_CACHE_LINE_SIZE, port);
+		return -EINVAL;
+	}
+
+	wq_base_addr = in->addr;
+	num_of_wq_entries_log = ilog2(in->num_of_wq_entries);
+
+	mutex_lock(&gaudi_nic->user_wq_lock);
+
+	if (type == HL_NIC_USER_WQ_SEND) {
+		NIC_WREG32(mmNIC0_TXE0_SQ_BASE_ADDRESS_49_32_0,
+				(wq_base_addr >> 32) & 0x3FFFFF);
+		NIC_WREG32(mmNIC0_TXE0_SQ_BASE_ADDRESS_31_0_0,
+				wq_base_addr & 0xFFFFFFFF);
+		NIC_WREG32(mmNIC0_TXE0_LOG_MAX_WQ_SIZE_0,
+				num_of_wq_entries_log - 2);
+	} else {
+		NIC_WREG32(mmNIC0_RXE0_WIN0_WQ_BASE_LO,
+				wq_base_addr & 0xFFFFFFFF);
+		NIC_WREG32(mmNIC0_RXE0_WIN0_WQ_BASE_HI,
+			((wq_base_addr >> 32) & 0xFFFFFFFF) |
+			((num_of_wq_entries_log - 4) << 24));
+	}
+
+	mutex_unlock(&gaudi_nic->user_wq_lock);
+
+	return 0;
+}
+
+static void _user_wq_arr_unset(struct hl_device *hdev, u32 port, u32 type)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+
+	gaudi_nic = &gaudi->nic_devices[port];
+
+	mutex_lock(&gaudi_nic->user_wq_lock);
+
+	if (type == HL_NIC_USER_WQ_SEND) {
+		NIC_WREG32(mmNIC0_TXE0_SQ_BASE_ADDRESS_49_32_0, 0);
+		NIC_WREG32(mmNIC0_TXE0_SQ_BASE_ADDRESS_31_0_0, 0);
+		NIC_WREG32(mmNIC0_TXE0_LOG_MAX_WQ_SIZE_0, 0);
+	} else {
+		NIC_WREG32(mmNIC0_RXE0_WIN0_WQ_BASE_LO, 0);
+		NIC_WREG32(mmNIC0_RXE0_WIN0_WQ_BASE_HI, 0);
+	}
+
+	mutex_unlock(&gaudi_nic->user_wq_lock);
+}
+
+static int user_wq_arr_unset(struct hl_device *hdev,
+				struct hl_nic_user_wq_arr_unset_in *in)
+{
+	u32 port, type;
+	int rc;
+
+	if (!in) {
+		dev_err(hdev->dev, "missing parameters, can't unset user WQ\n");
+		return -EINVAL;
+	}
+
+	type = in->type;
+	if (type != HL_NIC_USER_WQ_SEND && type != HL_NIC_USER_WQ_RECV) {
+		dev_err(hdev->dev, "invalid type %d, can't unset user WQ\n",
+			type);
+		return -EINVAL;
+	}
+
+	port = in->port;
+
+	rc = wq_port_check(hdev, port);
+	if (rc)
+		return rc;
+
+	_user_wq_arr_unset(hdev, port, type);
+
+	return 0;
+}
+
 static struct hl_qp *qp_get(struct hl_device *hdev,
 			struct gaudi_nic_device *gaudi_nic, u32 conn_id)
 {
@@ -3670,6 +3834,12 @@ int gaudi_nic_control(struct hl_device *hdev, u32 op, void *input, void *output)
 	case HL_NIC_OP_CQ_UPDATE_CONSUMED_CQES:
 		rc = cq_update_consumed_cqes(hdev, input);
 		break;
+	case HL_NIC_OP_USER_WQ_SET:
+		rc = user_wq_arr_set(hdev, input);
+		break;
+	case HL_NIC_OP_USER_WQ_UNSET:
+		rc = user_wq_arr_unset(hdev, input);
+		break;
 	default:
 		dev_err(hdev->dev, "Invalid NIC control request %d\n", op);
 		return -ENOTTY;
@@ -3709,6 +3879,19 @@ static void qps_destroy(struct hl_device *hdev)
 	}
 }
 
+static void wq_arrs_destroy(struct hl_device *hdev)
+{
+	int i;
+
+	for (i = 0 ; i < NIC_NUMBER_OF_PORTS ; i++) {
+		if (!(hdev->nic_ports_mask & BIT(i)))
+			continue;
+
+		_user_wq_arr_unset(hdev, i, HL_NIC_USER_WQ_SEND);
+		_user_wq_arr_unset(hdev, i, HL_NIC_USER_WQ_RECV);
+	}
+}
+
 void gaudi_nic_ctx_fini(struct hl_ctx *ctx)
 {
 	struct gaudi_device *gaudi = ctx->hdev->asic_specific;
@@ -3721,6 +3904,7 @@ void gaudi_nic_ctx_fini(struct hl_ctx *ctx)
 	/* wait for the NIC to digest the invalid QPs */
 	msleep(20);
 	cq_destroy(hdev);
+	wq_arrs_destroy(hdev);
 }
 
 static void nic_cq_vm_close(struct vm_area_struct *vma)

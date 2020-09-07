@@ -3988,3 +3988,98 @@ out:
 
 	return rc;
 }
+
+static char *get_syndrome_text(u32 syndrome)
+{
+	char *str;
+
+	switch (syndrome) {
+	case 0x05:
+		str = "Rx got invalid QP";
+		break;
+	case 0x06:
+		str = "Rx transport service mismatch";
+		break;
+	case 0x09:
+		str = "Rx Rkey check failed";
+		break;
+	case 0x40:
+		str = "timer retry exceeded";
+		break;
+	case 0x41:
+		str = "NACK retry exceeded";
+		break;
+	case 0x42:
+		str = "doorbell on invalid QP";
+		break;
+	case 0x43:
+		str = "doorbell security check failed";
+		break;
+	case 0x44:
+		str = "Tx got invalid QP";
+		break;
+	case 0x45:
+		str = "responder got ACK/NACK on invalid QP";
+		break;
+	case 0x46:
+		str = "responder try to send ACK/NACK on invalid QP";
+		break;
+	default:
+		str = "unknown syndrome";
+		break;
+	}
+
+	return str;
+}
+
+void gaudi_nic_handle_qp_err(struct hl_device *hdev, u16 event_type)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct qp_err *qp_err_arr;
+	struct hl_nic_cqe cqe_sw;
+	u32 pi, ci;
+
+	gaudi_nic = &gaudi->nic_devices[event_type - GAUDI_EVENT_NIC0_QP0];
+	qp_err_arr = gaudi_nic->qp_err_mem_cpu;
+
+	mutex_lock(&gaudi->nic_qp_err_lock);
+
+	if (!gaudi->nic_cq_enable)
+		dev_err_ratelimited(hdev->dev,
+			"received NIC %d QP error event %d but no CQ to push it\n",
+			gaudi_nic->port, event_type);
+
+	pi = NIC_RREG32(mmNIC0_QPC0_ERR_FIFO_PRODUCER_INDEX);
+	ci = gaudi_nic->qp_err_ci;
+
+	cqe_sw.is_err = true;
+	cqe_sw.port = gaudi_nic->port;
+
+	while (ci < pi) {
+		cqe_sw.type = QP_ERR_IS_REQ(qp_err_arr[ci]) ?
+				HL_NIC_CQE_TYPE_REQ : HL_NIC_CQE_TYPE_RES;
+		cqe_sw.qp_number = QP_ERR_QP_NUM(qp_err_arr[ci]);
+		cqe_sw.qp_err.syndrome = QP_ERR_ERR_NUM(qp_err_arr[ci]);
+
+		ci = (ci + 1) & (QP_ERR_BUF_LEN - 1);
+
+		dev_err_ratelimited(hdev->dev,
+			"NIC QP error port: %d, type: %d, qpn: %d, syndrome: %s (0x%x)\n",
+			cqe_sw.port, cqe_sw.type, cqe_sw.qp_number,
+			get_syndrome_text(cqe_sw.qp_err.syndrome),
+			cqe_sw.qp_err.syndrome);
+
+		if (gaudi->nic_cq_enable)
+			copy_cqe_to_main_queue(hdev, &cqe_sw);
+	}
+
+	gaudi_nic->qp_err_ci = ci;
+	NIC_WREG32(mmNIC0_QPC0_ERR_FIFO_CONSUMER_INDEX, ci);
+
+	/* signal the completion queue that there are available CQEs */
+	if (gaudi->nic_cq_enable)
+		complete(&gaudi->nic_cq_comp);
+
+	mutex_unlock(&gaudi->nic_qp_err_lock);
+}

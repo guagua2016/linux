@@ -568,6 +568,8 @@ void gaudi_nic_stop(struct hl_device *hdev);
 void gaudi_nic_ports_reopen(struct hl_device *hdev);
 int gaudi_nic_get_mac_addr(struct hl_device *hdev,
 				struct hl_info_mac_addr *mac_addr);
+int gaudi_nic_control(struct hl_device *hdev, u32 op, void *input,
+			void *output);
 void gaudi_nic_ctx_fini(struct hl_ctx *ctx);
 irqreturn_t gaudi_nic_rx_irq_handler(int irq, void *arg);
 irqreturn_t gaudi_nic_cq_irq_handler(int irq, void *arg);

@@ -24,6 +24,20 @@ static u32 hl_debug_struct_size[HL_DEBUG_OP_TIMESTAMP + 1] = {
 
 };
 
+static u32 hl_nic_input_size[HL_NIC_OP_DESTROY_CONN + 1] = {
+	[HL_NIC_OP_ALLOC_CONN] = sizeof(struct hl_nic_alloc_conn_in),
+	[HL_NIC_OP_SET_REQ_CONN_CTX] = sizeof(struct hl_nic_req_conn_ctx_in),
+	[HL_NIC_OP_SET_RES_CONN_CTX] = sizeof(struct hl_nic_res_conn_ctx_in),
+	[HL_NIC_OP_DESTROY_CONN] = sizeof(struct hl_nic_destroy_conn_in),
+};
+
+static u32 hl_nic_output_size[HL_NIC_OP_DESTROY_CONN + 1] = {
+	[HL_NIC_OP_ALLOC_CONN] = sizeof(struct hl_nic_alloc_conn_out),
+	[HL_NIC_OP_SET_REQ_CONN_CTX] = 0,
+	[HL_NIC_OP_SET_RES_CONN_CTX] = 0,
+	[HL_NIC_OP_DESTROY_CONN] = 0,
+};
+
 static int device_status_info(struct hl_device *hdev, struct hl_info_args *args)
 {
 	struct hl_info_device_status dev_stat = {0};
@@ -545,6 +559,87 @@ static int hl_debug_ioctl(struct hl_fpriv *hpriv, void *data)
 	return rc;
 }
 
+static int nic_control(struct hl_device *hdev, struct hl_nic_args *args)
+{
+	void *input = NULL, *output = NULL;
+	int rc;
+
+	if (args->input_ptr && args->input_size) {
+		input = kzalloc(hl_nic_input_size[args->op], GFP_KERNEL);
+		if (!input) {
+			rc = -ENOMEM;
+			goto out;
+		}
+
+		if (copy_from_user(input, u64_to_user_ptr(args->input_ptr),
+					args->input_size)) {
+			rc = -EFAULT;
+			dev_err(hdev->dev, "failed to copy input NIC data\n");
+			goto out;
+		}
+	}
+
+	if (args->output_ptr && args->output_size) {
+		output = kzalloc(hl_nic_output_size[args->op], GFP_KERNEL);
+		if (!output) {
+			rc = -ENOMEM;
+			goto out;
+		}
+	}
+
+	rc = hdev->asic_funcs->nic_control(hdev, args->op, input, output);
+	if (rc)
+		dev_err_ratelimited(hdev->dev,
+				"NIC control operation %d failed %d\n",
+				args->op, rc);
+
+	if (output && copy_to_user((void __user *) (uintptr_t) args->output_ptr,
+					output, args->output_size)) {
+		dev_err(hdev->dev, "copy to user failed in nic ioctl\n");
+		rc = -EFAULT;
+		goto out;
+	}
+
+out:
+	kfree(output);
+	kfree(input);
+
+	return rc;
+}
+
+static int hl_nic_ioctl(struct hl_fpriv *hpriv, void *data)
+{
+	struct hl_nic_args *args = data;
+	struct hl_device *hdev = hpriv->hdev;
+	int rc;
+
+	if (hl_device_disabled_or_in_reset(hdev)) {
+		dev_warn_ratelimited(hdev->dev,
+			"Device is %s. Can't execute NIC IOCTL\n",
+			atomic_read(&hdev->in_reset) ? "in_reset" : "disabled");
+		return -EBUSY;
+	}
+
+	switch (args->op) {
+	case HL_NIC_OP_ALLOC_CONN:
+	case HL_NIC_OP_SET_REQ_CONN_CTX:
+	case HL_NIC_OP_SET_RES_CONN_CTX:
+	case HL_NIC_OP_DESTROY_CONN:
+		args->input_size =
+			min(args->input_size, hl_nic_input_size[args->op]);
+		args->output_size =
+			min(args->output_size, hl_nic_output_size[args->op]);
+		rc = nic_control(hdev, args);
+		break;
+	default:
+		dev_err(hdev->dev, "Invalid request %d\n", args->op);
+		rc = -ENOTTY;
+		break;
+	}
+
+	return rc;
+}
+
 #define HL_IOCTL_DEF(ioctl, _func) \
 	[_IOC_NR(ioctl)] = {.cmd = ioctl, .func = _func}
 
@@ -554,7 +649,8 @@ static const struct hl_ioctl_desc hl_ioctls[] = {
 	HL_IOCTL_DEF(HL_IOCTL_CS, hl_cs_ioctl),
 	HL_IOCTL_DEF(HL_IOCTL_WAIT_CS, hl_cs_wait_ioctl),
 	HL_IOCTL_DEF(HL_IOCTL_MEMORY, hl_mem_ioctl),
-	HL_IOCTL_DEF(HL_IOCTL_DEBUG, hl_debug_ioctl)
+	HL_IOCTL_DEF(HL_IOCTL_DEBUG, hl_debug_ioctl),
+	HL_IOCTL_DEF(HL_IOCTL_NIC, hl_nic_ioctl)
 };
 
 static const struct hl_ioctl_desc hl_ioctls_control[] = {

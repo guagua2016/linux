@@ -58,6 +58,9 @@ enum link_status {
 #define MAC_CFG_XPCS91(addr, data)	\
 				mac_write(gaudi_nic, i, "xpcs91", addr, data)
 
+static struct hl_qp dummy_qp;
+static int qp_put(struct hl_qp *qp);
+
 static void qpc_cache_inv(struct gaudi_nic_device *gaudi_nic, bool is_req)
 {
 	struct hl_device *hdev = gaudi_nic->hdev;
@@ -2770,6 +2773,412 @@ int gaudi_nic_get_mac_addr(struct hl_device *hdev,
 out:
 	return 0;
 }
+
+static struct hl_qp *qp_get(struct hl_device *hdev,
+			struct gaudi_nic_device *gaudi_nic, u32 conn_id)
+{
+	struct hl_qp *qp;
+
+	mutex_lock(&gaudi_nic->idr_lock);
+	qp = idr_find(&gaudi_nic->qp_ids, conn_id);
+	if (!qp || qp == &dummy_qp) {
+		dev_err(hdev->dev,
+			"Failed to find matching QP for handle %d in port %d\n",
+			conn_id, gaudi_nic->port);
+		goto out;
+	}
+
+	kref_get(&qp->refcount);
+out:
+	mutex_unlock(&gaudi_nic->idr_lock);
+
+	return qp;
+}
+
+static void qp_do_release(struct hl_qp *qp)
+{
+	mutex_destroy(&qp->qpc_lock);
+	kfree(qp);
+}
+
+static void qp_release(struct kref *ref)
+{
+	struct hl_qp *qp = container_of(ref, struct hl_qp, refcount);
+	struct gaudi_nic_device *gaudi_nic = qp->gaudi_nic;
+	struct hl_device *hdev = gaudi_nic->hdev;
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	void __iomem *base_bar_addr = hdev->pcie_bar[HBM_BAR_ID] -
+					gaudi->hbm_bar_cur_addr;
+	struct qpc_requester req_qpc = {};
+	struct qpc_responder res_qpc = {};
+	u64 req_qpc_addr, res_qpc_addr;
+	int i;
+
+	req_qpc_addr = REQ_QPC_ADDR(qp->port, qp->conn_id);
+	res_qpc_addr = RES_QPC_ADDR(qp->port, qp->conn_id);
+
+	REQ_QPC_SET_VALID(req_qpc, 0);
+	RES_QPC_SET_VALID(res_qpc, 0);
+
+	mutex_lock(&qp->qpc_lock);
+
+	if (qp->is_req)
+		for (i = 0 ; i < (sizeof(req_qpc) / sizeof(u64)) ; i++)
+			writeq(req_qpc.data[i], base_bar_addr +
+					(req_qpc_addr + i * 8));
+
+	if (qp->is_res)
+		for (i = 0 ; i < (sizeof(res_qpc) / sizeof(u64)) ; i++)
+			writeq(res_qpc.data[i], base_bar_addr +
+					(res_qpc_addr + i * 8));
+
+	/* Perform read to flush the writes of the connection context */
+	readq(hdev->pcie_bar[HBM_BAR_ID]);
+
+	if (qp->is_req)
+		qpc_cache_inv(gaudi_nic, true);
+	if (qp->is_res)
+		qpc_cache_inv(gaudi_nic, false);
+
+	mutex_unlock(&qp->qpc_lock);
+
+	/*
+	 * No need in removing the QP ID from the IDR. This will be done once
+	 * the IDR gets full. We do this lazy cleanup because we don't want to
+	 * reuse a QP ID immediately after a QP was destroyed.
+	 */
+	qp_do_release(qp);
+}
+
+static int qp_put(struct hl_qp *qp)
+{
+	return kref_put(&qp->refcount, qp_release);
+}
+
+/* "gaudi_nic->idr_lock" should be taken from the caller function if needed */
+static void qps_clean_dummies(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_qp *qp;
+	int qp_id;
+
+	idr_for_each_entry(&gaudi_nic->qp_ids, qp, qp_id)
+		if (qp == &dummy_qp)
+			idr_remove(&gaudi_nic->qp_ids, qp_id);
+}
+
+static int conn_ioctl_check(struct hl_device *hdev, u32 port, u32 conn_id)
+{
+	if (port >= NIC_NUMBER_OF_PORTS) {
+		dev_err(hdev->dev, "Invalid port %d\n", port);
+		return -EINVAL;
+	}
+
+	if (!(hdev->nic_ports_mask & BIT(port))) {
+		dev_err(hdev->dev, "Port %d is disabled\n", port);
+		return -ENODEV;
+	}
+
+	if (conn_id < HL_NIC_MIN_CONN_ID || conn_id > HL_NIC_MAX_CONN_ID) {
+		dev_err(hdev->dev, "Invalid connection ID %d for port %d\n",
+			conn_id, port);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int alloc_conn(struct hl_device *hdev, struct hl_nic_alloc_conn_in *in,
+			struct hl_nic_alloc_conn_out *out)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct hl_qp *qp;
+	int id, rc;
+
+	if (!in || !out) {
+		dev_err(hdev->dev,
+			"Missing parameters to allocate a NIC context\n");
+		return -EINVAL;
+	}
+
+	rc = conn_ioctl_check(hdev, in->port, HL_NIC_MIN_CONN_ID);
+	if (rc)
+		return rc;
+
+	qp = kzalloc(sizeof(*qp), GFP_KERNEL);
+	if (!qp)
+		return -ENOMEM;
+
+	gaudi_nic = &gaudi->nic_devices[in->port];
+	mutex_init(&qp->qpc_lock);
+	kref_init(&qp->refcount);
+	qp->gaudi_nic = gaudi_nic;
+	qp->port = in->port;
+
+	/* TODO: handle local/remote keys */
+
+	mutex_lock(&gaudi_nic->idr_lock);
+	id = idr_alloc(&gaudi_nic->qp_ids, qp, HL_NIC_MIN_CONN_ID,
+			HL_NIC_MAX_CONN_ID + 1, GFP_KERNEL);
+
+	if (id < 0) {
+		/* Try again after removing the dummy ids */
+		qps_clean_dummies(gaudi_nic);
+		id = idr_alloc(&gaudi_nic->qp_ids, qp, HL_NIC_MIN_CONN_ID,
+				HL_NIC_MAX_CONN_ID + 1, GFP_KERNEL);
+	}
+
+	qp->conn_id = id;
+	mutex_unlock(&gaudi_nic->idr_lock);
+
+	if (id < 0) {
+		qp_do_release(qp);
+		return id;
+	}
+
+	dev_dbg(hdev->dev, "Allocating connection id %d in port %d",
+		id, qp->port);
+
+	out->conn_id = id;
+
+	return 0;
+}
+
+static int set_req_conn_ctx(struct hl_device *hdev,
+				struct hl_nic_req_conn_ctx_in *in)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct qpc_requester req_qpc = {};
+	struct hl_qp *qp;
+	u64 req_qpc_addr;
+	int i, rc;
+
+	if (!in) {
+		dev_err(hdev->dev,
+			"Missing parameters to set a requester context\n");
+		return -EINVAL;
+	}
+
+	if (in->burst_size == 0) {
+		dev_err(hdev->dev,
+			"Burst size can't be disabled in requester context\n");
+		return -EINVAL;
+	}
+
+	rc = conn_ioctl_check(hdev, in->port, in->conn_id);
+	if (rc)
+		return rc;
+
+	gaudi_nic = &gaudi->nic_devices[in->port];
+
+	qp = qp_get(hdev, gaudi_nic, in->conn_id);
+	if (!qp)
+		return -EINVAL;
+
+	req_qpc_addr = REQ_QPC_ADDR(in->port, in->conn_id);
+	REQ_QPC_SET_DST_QP(req_qpc, in->dst_conn_id);
+	REQ_QPC_SET_PORT(req_qpc, 0);
+	REQ_QPC_SET_PRIORITY(req_qpc, in->priority);
+	REQ_QPC_SET_RKEY(req_qpc, qp->remote_key);
+	REQ_QPC_SET_DST_IP(req_qpc, in->dst_ip_addr);
+	REQ_QPC_SET_SRC_IP(req_qpc, in->src_ip_addr);
+	REQ_QPC_SET_DST_MAC_31_0(req_qpc, *(u32 *) in->dst_mac_addr);
+	REQ_QPC_SET_DST_MAC_47_32(req_qpc, *(u16 *) (in->dst_mac_addr + 4));
+	REQ_QPC_SET_SQ_NUM(req_qpc, in->sq_number);
+	REQ_QPC_SET_TM_GRANULARITY(req_qpc, in->timer_granularity);
+	REQ_QPC_SET_SOB_EN(req_qpc, in->enable_sob);
+	REQ_QPC_SET_TRANSPORT_SERVICE(req_qpc, TS_RC);
+	REQ_QPC_SET_BURST_SIZE(req_qpc, in->burst_size);
+	REQ_QPC_SET_LAST_IDX(req_qpc, in->last_index);
+	REQ_QPC_SET_WQ_BASE_ADDR(req_qpc, in->conn_id);
+	REQ_QPC_SET_SWQ_GRANULARITY(req_qpc, in->swq_granularity);
+	REQ_QPC_SET_VALID(req_qpc, 1);
+
+	mutex_lock(&qp->qpc_lock);
+
+	for (i = 0 ; i < (sizeof(req_qpc) / sizeof(u64)) ; i++)
+		writeq(req_qpc.data[i], hdev->pcie_bar[HBM_BAR_ID] +
+			((req_qpc_addr + i * 8) - gaudi->hbm_bar_cur_addr));
+
+	/* Perform read to flush the writes of the connection context */
+	readq(hdev->pcie_bar[HBM_BAR_ID]);
+
+	qp->is_req = true;
+	qpc_cache_inv(gaudi_nic, true);
+
+	mutex_unlock(&qp->qpc_lock);
+
+	qp_put(qp);
+
+	return 0;
+}
+
+static int set_res_conn_ctx(struct hl_device *hdev,
+				struct hl_nic_res_conn_ctx_in *in)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct qpc_responder res_qpc = {};
+	struct hl_qp *qp;
+	u64 res_qpc_addr;
+	int i, rc;
+
+	if (!in) {
+		dev_err(hdev->dev,
+			"Missing parameters to set a responder context\n");
+		return -EINVAL;
+	}
+
+	rc = conn_ioctl_check(hdev, in->port, in->conn_id);
+	if (rc)
+		return rc;
+
+	gaudi_nic = &gaudi->nic_devices[in->port];
+
+	qp = qp_get(hdev, gaudi_nic, in->conn_id);
+	if (!qp)
+		return -EINVAL;
+
+	res_qpc_addr = RES_QPC_ADDR(in->port, in->conn_id);
+	RES_QPC_SET_DST_QP(res_qpc, in->dst_conn_id);
+	RES_QPC_SET_PORT(res_qpc, 0);
+	RES_QPC_SET_PRIORITY(res_qpc, in->priority);
+	RES_QPC_SET_SQ_NUM(res_qpc, in->sq_number);
+	RES_QPC_SET_LKEY(res_qpc, qp->local_key);
+	RES_QPC_SET_DST_IP(res_qpc, in->dst_ip_addr);
+	RES_QPC_SET_SRC_IP(res_qpc, in->src_ip_addr);
+	RES_QPC_SET_DST_MAC_31_0(res_qpc, *(u32 *) in->dst_mac_addr);
+	RES_QPC_SET_DST_MAC_47_32(res_qpc, *(u16 *) (in->dst_mac_addr + 4));
+	RES_QPC_SET_TRANSPORT_SERVICE(res_qpc, TS_RC);
+	RES_QPC_SET_LOG_BUF_SIZE_MASK(res_qpc, 0);
+	RES_QPC_SET_SOB_EN(res_qpc, in->enable_sob);
+	RES_QPC_SET_VALID(res_qpc, 1);
+
+	mutex_lock(&qp->qpc_lock);
+
+	for (i = 0 ; i < (sizeof(res_qpc) / sizeof(u64)) ; i++)
+		writeq(res_qpc.data[i], hdev->pcie_bar[HBM_BAR_ID] +
+			((res_qpc_addr + i * 8) - gaudi->hbm_bar_cur_addr));
+
+	/* Perform read to flush the writes of the connection context */
+	readq(hdev->pcie_bar[HBM_BAR_ID]);
+
+	qp->is_res = true;
+	qpc_cache_inv(gaudi_nic, false);
+
+	mutex_unlock(&qp->qpc_lock);
+
+	qp_put(qp);
+
+	return 0;
+}
+
+static int destroy_conn(struct hl_device *hdev,
+			struct hl_nic_destroy_conn_in *in)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct hl_qp *qp;
+	int rc;
+
+	if (!in) {
+		dev_err(hdev->dev,
+			"Missing parameters to destroy a NIC context\n");
+		return -EINVAL;
+	}
+
+	rc = conn_ioctl_check(hdev, in->port, in->conn_id);
+	if (rc)
+		return rc;
+
+	gaudi_nic = &gaudi->nic_devices[in->port];
+
+	/* The QP pointer is replaced with the dummy QP to prevent other threads
+	 * from using the QP. The ID is kept allocated at this stage so the QP
+	 * context can be safely modified. qp_put() is called right afterwards.
+	 */
+	mutex_lock(&gaudi_nic->idr_lock);
+	qp = idr_replace(&gaudi_nic->qp_ids, &dummy_qp, in->conn_id);
+	mutex_unlock(&gaudi_nic->idr_lock);
+
+	if (IS_ERR(qp))
+		return PTR_ERR(qp);
+
+	qp_put(qp);
+
+	return 0;
+}
+
+int gaudi_nic_control(struct hl_device *hdev, u32 op, void *input, void *output)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	int rc;
+
+	if (!(gaudi->hw_cap_initialized & HW_CAP_NIC_DRV))
+		return -EFAULT;
+
+	switch (op) {
+	case HL_NIC_OP_ALLOC_CONN:
+		rc = alloc_conn(hdev, input, output);
+		break;
+	case HL_NIC_OP_SET_REQ_CONN_CTX:
+		rc = set_req_conn_ctx(hdev, input);
+		break;
+	case HL_NIC_OP_SET_RES_CONN_CTX:
+		rc = set_res_conn_ctx(hdev, input);
+		break;
+	case HL_NIC_OP_DESTROY_CONN:
+		rc = destroy_conn(hdev, input);
+		break;
+	default:
+		dev_err(hdev->dev, "Invalid NIC control request %d\n", op);
+		return -ENOTTY;
+	}
+
+	return rc;
+}
+
+static void qps_destroy(struct hl_device *hdev)
+{
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
+	struct hl_qp *qp;
+	int qp_id, i;
+
+	for (i = 0 ; i < NIC_NUMBER_OF_PORTS ; i++) {
+		if (!(hdev->nic_ports_mask & BIT(i)))
+			continue;
+
+		gaudi_nic = &gaudi->nic_devices[i];
+
+		/*
+		 * No need to acquire "gaudi_nic->idr_lock", as qps_destroy() is
+		 * only called when a context is closed, and in Gaudi we have a
+		 * single context.
+		 */
+
+		qps_clean_dummies(gaudi_nic);
+
+		idr_for_each_entry(&gaudi_nic->qp_ids, qp, qp_id) {
+			idr_remove(&gaudi_nic->qp_ids, qp_id);
+			if (qp_put(qp) != 1)
+				dev_err(hdev->dev,
+					"QP %d of port %d is still alive\n",
+					qp->conn_id, qp->port);
+		}
+	}
+}
+
 void gaudi_nic_ctx_fini(struct hl_ctx *ctx)
 {
+	struct hl_device *hdev = ctx->hdev;
+	struct gaudi_device *gaudi = hdev->asic_specific;
+
+	if (!(gaudi->hw_cap_initialized & HW_CAP_NIC_DRV))
+		return;
+
+	qps_destroy(hdev);
+	/* wait for the NIC to digest the invalid QPs */
+	msleep(20);
 }

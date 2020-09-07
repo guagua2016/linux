@@ -5277,6 +5277,13 @@ static int goya_nic_control(struct hl_device *hdev, u32 op, void *input,
 	return -ENXIO;
 }
 
+static int goya_nic_mmap(struct hl_device *hdev, struct vm_area_struct *vma)
+{
+	dev_err_ratelimited(hdev->dev,
+			"NIC mmap operations cannot be performed on Goya\n");
+	return -ENXIO;
+}
+
 static int goya_get_mac_addr(struct hl_device *hdev,
 			struct hl_info_mac_addr *mac_addr)
 {
@@ -5403,6 +5410,7 @@ static const struct hl_asic_funcs goya_funcs = {
 	.send_cpu_message = goya_send_cpu_message,
 	.get_hw_state = goya_get_hw_state,
 	.nic_control = goya_nic_control,
+	.nic_cq_mmap = goya_nic_mmap,
 	.pci_bars_map = goya_pci_bars_map,
 	.init_iatu = goya_init_iatu,
 	.get_mac_addr = goya_get_mac_addr,

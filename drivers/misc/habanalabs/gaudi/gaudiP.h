@@ -571,6 +571,7 @@ int gaudi_nic_get_mac_addr(struct hl_device *hdev,
 int gaudi_nic_control(struct hl_device *hdev, u32 op, void *input,
 			void *output);
 void gaudi_nic_ctx_fini(struct hl_ctx *ctx);
+int gaudi_nic_cq_mmap(struct hl_device *hdev, struct vm_area_struct *vma);
 irqreturn_t gaudi_nic_rx_irq_handler(int irq, void *arg);
 irqreturn_t gaudi_nic_cq_irq_handler(int irq, void *arg);
 netdev_tx_t gaudi_nic_handle_tx_pkt(struct gaudi_nic_device *gaudi_nic,

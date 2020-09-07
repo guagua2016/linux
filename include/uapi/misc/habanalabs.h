@@ -831,6 +831,9 @@ struct hl_debug_args {
 	__u32 ctx_id;
 };
 
+#define HL_NIC_MIN_CONN_ID	1
+#define HL_NIC_MAX_CONN_ID	1023
+
 /*
  * Various information operations such as:
  * - H/W IP information

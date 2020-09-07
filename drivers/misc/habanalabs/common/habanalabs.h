@@ -270,6 +270,8 @@ struct hl_mmu_properties {
  * @hw_queues_props: H/W queues properties.
  * @cpucp_info: received various information from CPU-CP regarding the H/W, e.g.
  *		available sensors.
+ * @cpucp_nic_info: received various information from CPU-CP regarding the NIC
+ *                  H/W, e.g. MAC addresses.
  * @uboot_ver: F/W U-boot version.
  * @preboot_ver: F/W Preboot version.
  * @dmmu: DRAM MMU address translation properties.
@@ -284,7 +286,7 @@ struct hl_mmu_properties {
  * @dram_user_base_address: DRAM physical start address for user access.
  * @dram_size: DRAM total size.
  * @dram_pci_bar_size: size of PCI bar towards DRAM.
- * @max_power_default: max power of the device after reset
+ * @max_power_default: max power of the device after reset.
  * @dram_size_for_default_page_mapping: DRAM size needed to map to avoid page
  *                                      fault.
  * @pcie_dbi_base_address: Base address of the PCIE_DBI block.
@@ -324,6 +326,7 @@ struct hl_mmu_properties {
 struct asic_fixed_properties {
 	struct hw_queue_properties	*hw_queues_props;
 	struct cpucp_info		cpucp_info;
+	struct cpucp_nic_info		cpucp_nic_info;
 	char				uboot_ver[VERSION_MAX_LEN];
 	char				preboot_ver[VERSION_MAX_LEN];
 	struct hl_mmu_properties	dmmu;
@@ -697,6 +700,7 @@ enum div_select_defs {
  * @wreg: Write a register. Needed for simulator support.
  * @halt_coresight: stop the ETF and ETR traces.
  * @ctx_init: context dependent initialization.
+ * @ctx_fini: context dependent cleanup.
  * @get_clk_rate: Retrieve the ASIC current and maximum clock rate in MHz
  * @get_queue_id_for_cq: Get the H/W queue id related to the given CQ index.
  * @read_device_fw_version: read the device's firmware versions that are
@@ -799,6 +803,7 @@ struct hl_asic_funcs {
 	void (*wreg)(struct hl_device *hdev, u32 reg, u32 val);
 	void (*halt_coresight)(struct hl_device *hdev);
 	int (*ctx_init)(struct hl_ctx *ctx);
+	void (*ctx_fini)(struct hl_ctx *ctx);
 	int (*get_clk_rate)(struct hl_device *hdev, u32 *cur_clk, u32 *max_clk);
 	u32 (*get_queue_id_for_cq)(struct hl_device *hdev, u32 cq_idx);
 	void (*read_device_fw_version)(struct hl_device *hdev,
@@ -1586,6 +1591,7 @@ struct hl_mmu_funcs {
  * @sync_stream_queue_idx: helper index for sync stream queues initialization.
  * @supports_coresight: is CoreSight supported.
  * @supports_soft_reset: is soft reset supported.
+ * @nic_rx_poll: enable NIC Rx in polling mode rather than IRQ.
  * @supports_cb_mapping: is mapping a CB to the device's MMU supported.
  */
 struct hl_device {
@@ -1686,10 +1692,13 @@ struct hl_device {
 	u8				sync_stream_queue_idx;
 	u8				supports_coresight;
 	u8				supports_soft_reset;
+	u8				nic_rx_poll;
 	u8				supports_cb_mapping;
 
 	/* Parameters for bring-up */
 	u64				nic_ports_mask;
+	u64				nic_ports_ext_mask;
+	u64				nic_auto_neg_mask;
 	u8				mmu_enable;
 	u8				mmu_huge_page_opt;
 	u8				cpu_enable;
@@ -1702,6 +1711,7 @@ struct hl_device {
 	u8				dram_scrambler_enable;
 	u8				hard_reset_on_fw_events;
 	u8				bmc_enable;
+	u8				nic_load_fw;
 	u8				rl_enable;
 };
 
@@ -1924,6 +1934,7 @@ void hl_fw_cpu_accessible_dma_pool_free(struct hl_device *hdev, size_t size,
 int hl_fw_send_heartbeat(struct hl_device *hdev);
 int hl_fw_cpucp_info_get(struct hl_device *hdev);
 int hl_fw_get_eeprom_data(struct hl_device *hdev, void *data, size_t max_size);
+int hl_fw_cpucp_nic_info_get(struct hl_device *hdev);
 int hl_fw_cpucp_pci_counters_get(struct hl_device *hdev,
 		struct hl_info_pci_counters *counters);
 int hl_fw_cpucp_total_energy_get(struct hl_device *hdev,

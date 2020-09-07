@@ -78,6 +78,7 @@
 #define GAUDI_PLDM_MMU_TIMEOUT_USEC	(MMU_CONFIG_TIMEOUT_USEC * 100)
 #define GAUDI_PLDM_QMAN0_TIMEOUT_USEC	(HL_DEVICE_TIMEOUT_USEC * 30)
 #define GAUDI_PLDM_TPC_KERNEL_WAIT_USEC	(HL_DEVICE_TIMEOUT_USEC * 30)
+#define GAUDI_PLDM_NIC_QPC_INV_USEC	(NIC_QPC_INV_USEC * 10)
 #define GAUDI_BOOT_FIT_REQ_TIMEOUT_USEC	1000000		/* 1s */
 #define GAUDI_MSG_TO_CPU_TIMEOUT_USEC	4000000		/* 4s */
 
@@ -458,7 +459,10 @@ static int gaudi_get_fixed_properties(struct hl_device *hdev)
 	prop->num_of_events = GAUDI_EVENT_SIZE;
 	prop->tpc_enabled_mask = TPC_ENABLED_MASK;
 
-	prop->max_power_default = MAX_POWER_DEFAULT_PCI;
+	if (hdev->card_type == cpucp_card_type_pmc)
+		prop->max_power_default = MAX_POWER_DEFAULT_PMC;
+	else
+		prop->max_power_default = MAX_POWER_DEFAULT_PCI;
 
 	prop->cb_pool_cb_cnt = GAUDI_CB_POOL_CB_CNT;
 	prop->cb_pool_cb_size = GAUDI_CB_POOL_CB_SIZE;
@@ -782,6 +786,14 @@ out:
 	return rc;
 }
 
+static int gaudi_nic_clear_mem(struct hl_device *hdev)
+{
+	if (!hdev->nic_ports_mask)
+		return 0;
+
+	return gaudi_memset_device_memory(hdev, NIC_DRV_ADDR, NIC_DRV_SIZE, 0);
+}
+
 static int gaudi_late_init(struct hl_device *hdev)
 {
 	struct gaudi_device *gaudi = hdev->asic_specific;
@@ -836,6 +848,12 @@ static int gaudi_late_init(struct hl_device *hdev)
 		goto disable_pci_access;
 	}
 
+	rc = gaudi_nic_clear_mem(hdev);
+	if (rc) {
+		dev_err(hdev->dev, "Failed to clear NIC memory\n");
+		goto disable_pci_access;
+	}
+
 	return 0;
 
 disable_pci_access:
@@ -863,6 +881,17 @@ static void gaudi_late_fini(struct hl_device *hdev)
 	kfree(channel_info_arr);
 
 	hdev->hl_chip_info->info = NULL;
+}
+
+static void gaudi_nic_handle_rx(struct gaudi_nic_device *gaudi_nic)
+{
+	/* at this point, interrupts were disabled by the H/W */
+	napi_schedule(&gaudi_nic->napi);
+}
+
+static int gaudi_nic_handle_tx(struct gaudi_nic_device *gaudi_nic, void *data)
+{
+	return gaudi_nic_handle_tx_pkt(gaudi_nic, data);
 }
 
 static int gaudi_alloc_cpu_accessible_dma_mem(struct hl_device *hdev)
@@ -1013,6 +1042,8 @@ static int gaudi_sw_init(struct hl_device *hdev)
 	}
 
 	gaudi->cpucp_info_get = gaudi_cpucp_info_get;
+	gaudi->nic_handle_rx = gaudi_nic_handle_rx;
+	gaudi->nic_handle_tx = gaudi_nic_handle_tx;
 
 	gaudi->max_freq_value = GAUDI_MAX_CLK_FREQ;
 
@@ -1053,14 +1084,29 @@ static int gaudi_sw_init(struct hl_device *hdev)
 	if (rc)
 		goto free_cpu_accessible_dma_pool;
 
+	rc = gaudi_nic_sw_init(hdev);
+	if (rc) {
+		dev_err(hdev->dev, "Failed to init NIC S/W\n");
+		rc = -ENOMEM;
+		goto free_internal_qmans_pq_mem;
+	}
+
 	spin_lock_init(&gaudi->hw_queues_lock);
 	mutex_init(&gaudi->clk_gate_mutex);
 
+	/* Device CPU loads the PHY F/W at boot */
+	gaudi->nic_phy_load_fw = (!hdev->cpu_enable && !hdev->pldm) ||
+					(hdev->nic_load_fw);
+	gaudi->nic_phy_config_fw = !hdev->pldm;
+	gaudi->nic_qpc_cache_inv_timeout = hdev->pldm ?
+			GAUDI_PLDM_NIC_QPC_INV_USEC : NIC_QPC_INV_USEC;
 	hdev->supports_sync_stream = true;
 	hdev->supports_coresight = true;
 
 	return 0;
 
+free_internal_qmans_pq_mem:
+	gaudi_free_internal_qmans_pq_mem(hdev);
 free_cpu_accessible_dma_pool:
 	gen_pool_destroy(hdev->cpu_accessible_dma_pool);
 free_cpu_dma_mem:
@@ -1080,6 +1126,8 @@ free_gaudi_device:
 static int gaudi_sw_fini(struct hl_device *hdev)
 {
 	struct gaudi_device *gaudi = hdev->asic_specific;
+
+	gaudi_nic_sw_fini(hdev);
 
 	gaudi_free_internal_qmans_pq_mem(hdev);
 
@@ -1104,6 +1152,8 @@ static int gaudi_sw_fini(struct hl_device *hdev)
 static irqreturn_t gaudi_irq_handler_single(int irq, void *arg)
 {
 	struct hl_device *hdev = arg;
+	struct gaudi_device *gaudi = hdev->asic_specific;
+	struct gaudi_nic_device *gaudi_nic;
 	int i;
 
 	if (hdev->disabled)
@@ -1112,6 +1162,16 @@ static irqreturn_t gaudi_irq_handler_single(int irq, void *arg)
 	for (i = 0 ; i < hdev->asic_prop.completion_queues_count ; i++)
 		hl_irq_handler_cq(irq, &hdev->completion_queue[i]);
 
+	for (i = 0 ; i < NIC_NUMBER_OF_PORTS ; i++) {
+		gaudi_nic = &gaudi->nic_devices[i];
+
+		if (!(hdev->nic_ports_mask & BIT(i)) || (!gaudi_nic->port_open))
+			continue;
+
+		gaudi_nic_rx_irq_handler(irq, gaudi_nic);
+	}
+
+	gaudi_nic_cq_irq_handler(irq, hdev);
 	hl_irq_handler_eq(irq, &hdev->event_queue);
 
 	return IRQ_HANDLED;
@@ -1271,12 +1331,44 @@ static void gaudi_disable_msi(struct hl_device *hdev)
 static void gaudi_init_scrambler_sram(struct hl_device *hdev)
 {
 	struct gaudi_device *gaudi = hdev->asic_specific;
+	u32 status;
+	int rc;
 
 	if (gaudi->hw_cap_initialized & HW_CAP_SRAM_SCRAMBLER)
 		return;
 
 	if (!hdev->sram_scrambler_enable)
 		return;
+
+	/* In case we don't load F/W, we must wait for uboot to finish before
+	 * we enable scrambling. Otherwise, we risk interrupting it in the
+	 * middle of initialization, which can cause the device to get stuck
+	 */
+	if ((!hdev->pldm) && (hdev->cpu_enable) && (!hdev->fw_loading)) {
+		dev_info(hdev->dev,
+			"Waiting for u-boot to finish before enabling SRAM scrambler\n");
+
+		rc = hl_poll_timeout(
+			hdev,
+			mmPSOC_GLOBAL_CONF_CPU_BOOT_STATUS,
+			status,
+			(status == CPU_BOOT_STATUS_NIC_FW_RDY) ||
+			(status == CPU_BOOT_STATUS_READY_TO_BOOT) ||
+			(status == CPU_BOOT_STATUS_SRAM_AVAIL),
+			10000,
+			GAUDI_NIC_FW_TIMEOUT_USEC);
+
+		if (rc)
+			dev_warn(hdev->dev,
+				"Failed to detect u-boot has finished loading NIC F/W. Maybe running old F/W?\n");
+
+		if (status != CPU_BOOT_STATUS_SRAM_AVAIL)
+			ssleep(1);
+
+		/* Stop the device CPU to make sure nothing bad happens */
+		WREG32(mmPSOC_GLOBAL_CONF_KMD_MSG_TO_CPU, KMD_MSG_GOTO_WFE);
+		msleep(GAUDI_CPU_RESET_WAIT_MSEC);
+	}
 
 	WREG32(mmNIF_RTR_CTRL_0_SCRAM_SRAM_EN,
 			1 << IF_RTR_CTRL_SCRAM_SRAM_EN_VAL_SHIFT);
@@ -2874,6 +2966,13 @@ static void gaudi_halt_engines(struct hl_device *hdev, bool hard_reset)
 	else
 		wait_timeout_ms = GAUDI_RESET_WAIT_MSEC;
 
+	/*
+	 * Mark the NIC as in reset to avoid any new NIC accesses to the
+	 * H/W. This must be done before we stop the CPU as the NIC
+	 * might use it e.g. get/set EEPROM data.
+	 */
+	gaudi_nic_hard_reset_prepare(hdev);
+
 	gaudi_stop_nic_qmans(hdev);
 
 	gaudi_stop_mme_qmans(hdev);
@@ -2900,6 +2999,8 @@ static void gaudi_halt_engines(struct hl_device *hdev, bool hard_reset)
 
 	gaudi_disable_timestamp(hdev);
 
+	/* NIC stop must be called before MSI is disabled */
+	gaudi_nic_stop(hdev);
 	gaudi_disable_msi(hdev);
 }
 
@@ -3184,6 +3285,16 @@ static int gaudi_hw_init(struct hl_device *hdev)
 
 	gaudi_init_hbm_dma_qmans(hdev);
 
+	/*
+	 * Before pushing u-boot/linux to device, need to set the hbm bar to
+	 * base address of dram
+	 */
+	if (gaudi_set_hbm_bar_base(hdev, DRAM_PHYS_BASE) == U64_MAX) {
+		dev_err(hdev->dev,
+			"failed to map HBM bar to DRAM base address\n");
+		return -EIO;
+	}
+
 	rc = gaudi_init_cpu(hdev);
 	if (rc) {
 		dev_err(hdev->dev, "failed to initialize CPU\n");
@@ -3315,7 +3426,7 @@ static void gaudi_hw_fini(struct hl_device *hdev, bool hard_reset)
 					HW_CAP_HBM_DMA | HW_CAP_PLL |
 					HW_CAP_NIC_MASK | HW_CAP_MMU |
 					HW_CAP_SRAM_SCRAMBLER |
-					HW_CAP_HBM_SCRAMBLER |
+					HW_CAP_HBM_SCRAMBLER | HW_CAP_NIC_DRV |
 					HW_CAP_CLK_GATE);
 
 	memset(gaudi->events_stat, 0, sizeof(gaudi->events_stat));
@@ -6107,6 +6218,45 @@ static void gaudi_print_irq_info(struct hl_device *hdev, u16 event_type,
 	}
 }
 
+static void gaudi_print_nic_axi_irq_info(struct hl_device *hdev, u16 event_type,
+						void *data)
+{
+	char desc[64] = "", *type;
+	struct eq_nic_sei_event *eq_nic_sei = data;
+	u16 nic_id = event_type - GAUDI_EVENT_NIC_SEI_0;
+
+	switch (eq_nic_sei->axi_error_cause) {
+	case RXB:
+		type = "RXB";
+		break;
+	case RXE:
+		type = "RXE";
+		break;
+	case TXS:
+		type = "TXS";
+		break;
+	case TXE:
+		type = "TXE";
+		break;
+	case QPC_RESP:
+		type = "QPC_RESP";
+		break;
+	case NON_AXI_ERR:
+		type = "NON_AXI_ERR";
+		break;
+	default:
+		dev_err(hdev->dev, "unknown NIC AXI cause %d\n",
+			eq_nic_sei->axi_error_cause);
+		type = "N/A";
+		break;
+	}
+
+	snprintf(desc, sizeof(desc), "NIC%d_%s%d", nic_id, type,
+			eq_nic_sei->id);
+	dev_err_ratelimited(hdev->dev, "Received H/W interrupt %d [\"%s\"]\n",
+		event_type, desc);
+}
+
 static int gaudi_soft_reset_late_init(struct hl_device *hdev)
 {
 	struct gaudi_device *gaudi = hdev->asic_specific;
@@ -6305,6 +6455,7 @@ static void gaudi_handle_eqe(struct hl_device *hdev,
 				struct hl_eq_entry *eq_entry)
 {
 	struct gaudi_device *gaudi = hdev->asic_specific;
+	u64 data = le64_to_cpu(eq_entry->data[0]);
 	u32 ctl = le32_to_cpu(eq_entry->hdr.ctl);
 	u16 event_type = ((ctl & EQ_CTL_EVENT_TYPE_MASK)
 			>> EQ_CTL_EVENT_TYPE_SHIFT);
@@ -6333,6 +6484,7 @@ static void gaudi_handle_eqe(struct hl_device *hdev,
 	case GAUDI_EVENT_PSOC_MEM_DERR:
 	case GAUDI_EVENT_PSOC_CORESIGHT_DERR:
 	case GAUDI_EVENT_SRAM0_DERR ... GAUDI_EVENT_SRAM28_DERR:
+	case GAUDI_EVENT_NIC0_DERR ... GAUDI_EVENT_NIC4_DERR:
 	case GAUDI_EVENT_DMA_IF0_DERR ... GAUDI_EVENT_DMA_IF3_DERR:
 	case GAUDI_EVENT_HBM_0_DERR ... GAUDI_EVENT_HBM_3_DERR:
 	case GAUDI_EVENT_MMU_DERR:
@@ -6434,6 +6586,7 @@ static void gaudi_handle_eqe(struct hl_device *hdev,
 	case GAUDI_EVENT_PSOC_MEM_SERR:
 	case GAUDI_EVENT_PSOC_CORESIGHT_SERR:
 	case GAUDI_EVENT_SRAM0_SERR ... GAUDI_EVENT_SRAM28_SERR:
+	case GAUDI_EVENT_NIC0_SERR ... GAUDI_EVENT_NIC4_SERR:
 	case GAUDI_EVENT_DMA_IF0_SERR ... GAUDI_EVENT_DMA_IF3_SERR:
 	case GAUDI_EVENT_HBM_0_SERR ... GAUDI_EVENT_HBM_3_SERR:
 		fallthrough;
@@ -6494,6 +6647,11 @@ static void gaudi_handle_eqe(struct hl_device *hdev,
 	case GAUDI_EVENT_TPC7_BMON_SPMU:
 	case GAUDI_EVENT_DMA_BM_CH0 ... GAUDI_EVENT_DMA_BM_CH7:
 		gaudi_print_irq_info(hdev, event_type, false);
+		hl_fw_unmask_irq(hdev, event_type);
+		break;
+
+	case GAUDI_EVENT_NIC_SEI_0 ... GAUDI_EVENT_NIC_SEI_4:
+		gaudi_print_nic_axi_irq_info(hdev, event_type, &data);
 		hl_fw_unmask_irq(hdev, event_type);
 		break;
 
@@ -7002,6 +7160,19 @@ static int gaudi_ctx_init(struct hl_ctx *ctx)
 	return 0;
 }
 
+static void gaudi_ctx_fini(struct hl_ctx *ctx)
+{
+	struct hl_device *hdev = ctx->hdev;
+
+	/* Gaudi will NEVER support more then a single compute context.
+	 * Therefore, don't clear anything unless it is the compute context
+	 */
+	if (hdev->compute_ctx != ctx)
+		return;
+
+	gaudi_nic_ctx_fini(ctx);
+}
+
 static u32 gaudi_get_queue_id_for_cq(struct hl_device *hdev, u32 cq_idx)
 {
 	return gaudi_cq_assignment[cq_idx];
@@ -7305,6 +7476,7 @@ static const struct hl_asic_funcs gaudi_funcs = {
 	.wreg = hl_wreg,
 	.halt_coresight = gaudi_halt_coresight,
 	.ctx_init = gaudi_ctx_init,
+	.ctx_fini = gaudi_ctx_fini,
 	.get_clk_rate = gaudi_get_clk_rate,
 	.get_queue_id_for_cq = gaudi_get_queue_id_for_cq,
 	.read_device_fw_version = gaudi_read_device_fw_version,

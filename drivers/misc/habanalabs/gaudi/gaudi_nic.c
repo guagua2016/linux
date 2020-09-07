@@ -687,13 +687,26 @@ static void config_port_mac(struct gaudi_nic_device *gaudi_nic)
 	}
 }
 
+static void phy_start_stop(struct gaudi_nic_device *gaudi_nic, bool is_start)
+{
+	int i;
+
+	for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+		if (!(gaudi_nic->power_up_mask & BIT(i)))
+			continue;
+
+		gaudi_nic_phy_start_stop(gaudi_nic, i, is_start);
+	}
+}
+
 static int hw_config(struct gaudi_nic_device *gaudi_nic)
 {
 	struct hl_device *hdev = gaudi_nic->hdev;
 	struct gaudi_device *gaudi = hdev->asic_specific;
 	u64 mac_addr = 0, tmr_addr;
 	u32 port = gaudi_nic->port, data_rate, speed = gaudi_nic->speed;
-	int i;
+	int i, rc;
+	bool do_auto_neg;
 
 	for (i = 0 ; i < ETH_ALEN ; i++) {
 		mac_addr <<= 8;
@@ -728,6 +741,26 @@ static int hw_config(struct gaudi_nic_device *gaudi_nic)
 		port, speed, data_rate);
 
 	gaudi_nic->data_rate = data_rate;
+
+	if (gaudi->nic_phy_config_fw && !gaudi_nic->mac_loopback) {
+		for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+			if (!(gaudi_nic->power_up_mask & BIT(i)))
+				continue;
+
+			do_auto_neg = gaudi_nic->auto_neg_enable &&
+					(gaudi_nic->auto_neg_mask & BIT(i));
+
+			rc = gaudi_nic_phy_power_up(gaudi_nic, i, do_auto_neg);
+			if (rc) {
+				dev_err(hdev->dev,
+					"PHY power up failed for port %d\n",
+					port);
+				return rc;
+			}
+		}
+
+		phy_start_stop(gaudi_nic, true);
+	}
 
 	/* if no need in macro configuration, do only port configuration */
 	if (gaudi_nic->do_macro_cfg) {
@@ -1191,6 +1224,364 @@ static void port_reset_state(struct gaudi_nic_device *gaudi_nic)
 	gaudi_nic->uncorrectable_errors_cnt = 0;
 }
 
+static void phy_reconfig(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	struct gaudi_device *gaudi = gaudi_nic->hdev->asic_specific;
+	u32 port = gaudi_nic->port;
+	int i, rc;
+
+	if (!gaudi->nic_phy_config_fw)
+		return;
+
+	dev_dbg(hdev->dev, "reconfiguring PHY, port %d\n", port);
+
+	if (gaudi_nic->auto_neg_enable) {
+		for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+			if (!(gaudi_nic->auto_neg_mask & BIT(i)))
+				continue;
+
+			rc = gaudi_nic_phy_fw_config_auto_neg(gaudi_nic, i);
+			if (rc)
+				dev_dbg(hdev->dev,
+					"F/W reconfig autoneg failed, port: %d, lane: %d\n",
+					port, i);
+		}
+	} else {
+		for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+			if (!(gaudi_nic->power_up_mask & BIT(i)))
+				continue;
+
+			rc = gaudi_nic_phy_power_up(gaudi_nic, i, false);
+			if (rc) {
+				dev_err(hdev->dev,
+					"PHY reconfig power up failed for port %d\n",
+					port);
+				break;
+			}
+		}
+	}
+
+	port_reset_state(gaudi_nic);
+}
+
+static enum link_status update_pcs_link_failure(
+					struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	struct gaudi_device *gaudi = gaudi_nic->hdev->asic_specific;
+	struct kfifo *pcs_fifo = &gaudi_nic->pcs_fail_fifo;
+	ktime_t now, before;
+	u32 port = gaudi_nic->port;
+	int count;
+
+	if (!gaudi_nic->auto_neg_enable)
+		return PCS_DOWN;
+
+	now = ktime_get();
+
+	count = kfifo_in(pcs_fifo, &now, sizeof(now));
+	if (count != sizeof(now)) {
+		dev_err(hdev->dev,
+			"Failed to push to PCS fifo, size: %d, count: %d, port: %d\n",
+			gaudi_nic->pcs_fail_cnt, count, port);
+		return PCS_DOWN;
+	}
+
+	gaudi_nic->pcs_fail_cnt++;
+
+	if (gaudi_nic->pcs_fail_cnt < gaudi->nic_pcs_fail_threshold)
+		return PCS_DOWN;
+
+	/*
+	 * Here we reached the threshold count of failures to reconfigure the
+	 * link. Now need to check if all of the failure are in the needed time
+	 * frame. It is sufficient to check the first item in the queue as it is
+	 * the earliest failure and if it is in the needed time frame, all the
+	 * rest if failures are in it too.
+	 */
+	count = kfifo_out_peek(pcs_fifo, &before, sizeof(before));
+	if (count != sizeof(before))
+		dev_err(hdev->dev,
+			"Failed to peek in PCS fifo, size: %d, count: %d, port: %d\n",
+			gaudi_nic->pcs_fail_cnt, count, port);
+
+	if (ktime_ms_delta(now, before) <=
+			(gaudi->nic_pcs_fail_time_frame * MSEC_PER_SEC)) {
+		dev_dbg(hdev->dev,
+			"PHY reconfig due to PCS link failure cnt, port: %d\n",
+			port);
+		return FAIL_RECONFIG;
+	}
+
+	/*
+	 * The earliest failure is not in the needed time frame, hence
+	 * we can remove it.
+	 */
+	count = kfifo_out(pcs_fifo, &before, sizeof(before));
+	if (count != sizeof(before))
+		dev_err(hdev->dev,
+			"Failed to pop from PCS fifo, size: %d, count: %d, port: %d\n",
+			gaudi_nic->pcs_fail_cnt, count, port);
+
+	gaudi_nic->pcs_fail_cnt--;
+
+	return PCS_DOWN;
+}
+
+static void reset_tx(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	int i;
+
+	/* This temporary WA is only for HLS external ports */
+	if ((hdev->card_type != cpucp_card_type_pmc) ||
+			(BIT(gaudi_nic->port) & ~hdev->nic_ports_ext_mask))
+		return;
+
+	for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++)
+		if (gaudi_nic->fw_tuning_mask & BIT(i))
+			gaudi_nic_phy_reset_tx(gaudi_nic, i);
+}
+
+static enum link_status _check_pcs_link(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	u32 port = gaudi_nic->port, pcs_val, mac_val,
+		start_lane = __ffs(gaudi_nic->fw_tuning_mask);
+	int i, rc;
+
+	for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+		if (!(gaudi_nic->fw_tuning_mask & BIT(i)))
+			continue;
+
+		rc = gaudi_nic_phy_check_link_status(gaudi_nic, i);
+		if (rc)
+			return PHY_DOWN;
+	}
+
+	/* need to check the first lane only */
+	mac_val = gaudi_nic_mac_read(gaudi_nic, start_lane, "mac", 0x40);
+
+	if (mac_val & 1)
+		gaudi_nic->pcs_local_fault_cnt++;
+	else if (gaudi_nic->pcs_local_fault_cnt)
+		gaudi_nic->pcs_local_fault_cnt--;
+
+	if (mac_val & 2)
+		gaudi_nic->pcs_remote_fault_cnt++;
+	else if (gaudi_nic->pcs_remote_fault_cnt)
+		gaudi_nic->pcs_remote_fault_cnt--;
+
+	if (gaudi_nic->pcs_remote_fault_cnt == PCS_FAULT_THRESHOLD) {
+		dev_dbg(hdev->dev,
+			"PHY reconfig due to PCS remote fault cnt, port: %d\n",
+			port);
+		return FAULT_RECONFIG;
+	}
+
+	/* need to check the first lane only */
+	pcs_val = gaudi_nic_mac_read(gaudi_nic, start_lane, "xpcs", 0x20);
+
+	if ((pcs_val >> 12) & 1)
+		return LINK_UP;
+
+	return PCS_DOWN;
+}
+
+static void check_pcs_link(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	struct gaudi_device *gaudi = gaudi_nic->hdev->asic_specific;
+	u32 port = gaudi_nic->port;
+	enum link_status link_status;
+
+	if (!gaudi->nic_check_link)
+		return;
+
+	link_status = _check_pcs_link(gaudi_nic);
+	if ((link_status == PCS_DOWN) || (link_status == PHY_DOWN)) {
+		/* Try again to overcome a momentary glitch */
+		msleep(PCS_LINK_RETRY_MSEC);
+
+		link_status = _check_pcs_link(gaudi_nic);
+
+		if (link_status == LINK_UP)
+			dev_info(hdev->dev, "PCS link restored, port %d\n",
+					port);
+	}
+
+	if (link_status == LINK_UP)
+		return;
+
+	set_port_status(gaudi_nic, false);
+	gaudi_nic->pcs_link = false;
+	gaudi_nic->last_pcs_link_drop_ts = ktime_get();
+
+	dev_info(hdev->dev, "%s lost signal, port %d\n",
+			(link_status == PHY_DOWN) ? "PHY" : "PCS", port);
+
+	/* TODO: fix the bug in the retimer to remove this Tx reset WA */
+	/*
+	 * No need to update about the PCS failure if we already need to
+	 * reconfigure the PHY.
+	 */
+	if (link_status == FAULT_RECONFIG)
+		reset_tx(gaudi_nic);
+	else
+		link_status = update_pcs_link_failure(gaudi_nic);
+
+	if ((link_status == FAULT_RECONFIG) ||
+			(link_status == FAIL_RECONFIG))
+		phy_reconfig(gaudi_nic);
+}
+
+static void acquire_pcs_link(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	u32 port = gaudi_nic->port, pcs_val,
+		start_lane = __ffs(gaudi_nic->fw_tuning_mask);
+
+	/* need to check the first lane only */
+	pcs_val = gaudi_nic_mac_read(gaudi_nic, start_lane, "xpcs", 0x20);
+	gaudi_nic->pcs_link = (pcs_val >> 12) & 1;
+	gaudi_nic->retry_cnt++;
+
+	if (gaudi_nic->pcs_link) {
+		dev_info(hdev->dev, "PCS link up, port %d\n", port);
+		set_port_status(gaudi_nic, true);
+		gaudi_nic->retry_cnt = 0;
+	} else if (gaudi_nic->retry_cnt == PCS_LINK_CNT) {
+		if (ktime_after(gaudi_nic->last_fw_tuning_ts,
+				gaudi_nic->last_pcs_link_drop_ts))
+			dev_dbg(hdev->dev,
+				"PHY_reconfig due to PCS link down after F/W tuning, port %d\n",
+				port);
+		else
+			dev_dbg(hdev->dev,
+				"PHY reconfig due to PCS link cnt, port %d\n",
+				port);
+		phy_reconfig(gaudi_nic);
+	}
+}
+
+static void do_fw_tuning(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	u32 port = gaudi_nic->port;
+	int i, rc = 0;
+
+	for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+		if (!(gaudi_nic->fw_tuning_mask & BIT(i)))
+			continue;
+
+		rc = gaudi_nic_phy_fw_tuning(gaudi_nic, i, true);
+		if (rc) {
+			if (rc == -EAGAIN) {
+				if (gaudi_nic->retry_cnt++ == FW_TUNING_CNT) {
+					dev_dbg(hdev->dev,
+						"PHY reconfig due to F/W tuning cnt, port %d, lane %d\n",
+						port, i);
+					phy_reconfig(gaudi_nic);
+				}
+			} else {
+				dev_dbg(hdev->dev,
+					"PHY F/W tuning failed for port %d, lane %d, rc %d\n",
+					port, i, rc);
+				phy_reconfig(gaudi_nic);
+			}
+			break;
+		}
+	}
+
+	if (!rc) {
+		gaudi_nic->phy_fw_tuned = true;
+		gaudi_nic->retry_cnt = 0;
+		gaudi_nic->last_fw_tuning_ts = ktime_get();
+	}
+}
+
+static void do_fw_tuning_auto_neg(struct gaudi_nic_device *gaudi_nic)
+{
+	struct hl_device *hdev = gaudi_nic->hdev;
+	u32 port = gaudi_nic->port;
+	int i, rc;
+
+	for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+		if (!(gaudi_nic->auto_neg_mask & BIT(i)))
+			continue;
+
+		rc = gaudi_nic_phy_fw_tuning(gaudi_nic, i, false);
+		if (rc) {
+			if (rc != -EAGAIN)
+				dev_dbg(hdev->dev,
+					"PHY auto neg F/W tuning failed, port %d, lane %d, rc %d\n",
+					port, i, rc);
+			return;
+		}
+	}
+
+	for (i = NIC_MAC_LANES_START ; i < NIC_MAC_NUM_OF_LANES ; i++) {
+		if (!(gaudi_nic->fw_tuning_mask & BIT(i)))
+			continue;
+
+		rc = gaudi_nic_phy_config_pam4_link_training(gaudi_nic, i);
+		if (rc) {
+			if (rc == -EAGAIN) {
+				if (gaudi_nic->retry_cnt++ ==
+						FW_LINK_TRAINING_CNT) {
+					dev_dbg(hdev->dev,
+						"PHY reconfig due to PAM4 cnt, port: %d, lane: %d\n",
+						port, i);
+					phy_reconfig(gaudi_nic);
+				}
+			} else {
+				dev_dbg(hdev->dev,
+					"PHY auto neg F/W speed config failed, port %d, lane %d, rc %d\n",
+					port, i, rc);
+				phy_reconfig(gaudi_nic);
+			}
+
+			return;
+		}
+	}
+
+	dev_dbg(hdev->dev, "auto neg done, port: %d\n", port);
+	gaudi_nic->auto_neg_resolved = true;
+	gaudi_nic->retry_cnt = 0;
+	do_fw_tuning(gaudi_nic);
+}
+
+static void check_link_status(struct work_struct *work)
+{
+	struct gaudi_nic_device *gaudi_nic = container_of(work,
+							struct gaudi_nic_device,
+							link_status_work.work);
+	u32 timeout_ms;
+
+	if (gaudi_nic->phy_fw_tuned) {
+		if (gaudi_nic->pcs_link)
+			check_pcs_link(gaudi_nic);
+		else
+			acquire_pcs_link(gaudi_nic);
+	} else {
+		if (gaudi_nic->auto_neg_enable && !gaudi_nic->auto_neg_resolved)
+			do_fw_tuning_auto_neg(gaudi_nic);
+		else
+			do_fw_tuning(gaudi_nic);
+	}
+
+	if (gaudi_nic->pcs_link)
+		timeout_ms = 1000;
+	else if (gaudi_nic->phy_fw_tuned)
+		timeout_ms = 500;
+	else
+		timeout_ms = 1;
+
+	schedule_delayed_work(&gaudi_nic->link_status_work,
+				msecs_to_jiffies(timeout_ms));
+}
+
 static int _gaudi_nic_sw_init(struct gaudi_nic_device *gaudi_nic)
 {
 	struct hl_device *hdev = gaudi_nic->hdev;
@@ -1576,7 +1967,13 @@ static int port_open(struct gaudi_nic_device *gaudi_nic)
 		napi_enable(&gaudi_nic->napi);
 	}
 
-	set_port_status(gaudi_nic, true);
+	if (gaudi->nic_phy_config_fw && !gaudi_nic->mac_loopback) {
+		INIT_DELAYED_WORK(&gaudi_nic->link_status_work,
+					check_link_status);
+		schedule_delayed_work(&gaudi_nic->link_status_work, 0);
+	} else {
+		set_port_status(gaudi_nic, true);
+	}
 
 	gaudi_nic->port_open = true;
 
@@ -1628,9 +2025,16 @@ static void port_close(struct gaudi_nic_device *gaudi_nic)
 	gaudi_nic->port_open = false;
 	gaudi_nic->active = false;
 
+	if (gaudi->nic_phy_config_fw && !gaudi_nic->mac_loopback)
+		cancel_delayed_work_sync(&gaudi_nic->link_status_work);
+
 	/* Print if not in hard reset flow e.g. from ifconfig */
 	if (gaudi_nic->pcs_link && !hdev->hard_reset_pending)
 		dev_info(hdev->dev, "port %d was closed\n", port);
+
+	/* stop F/W so the peer port will also lose link */
+	if (gaudi->nic_phy_config_fw && !gaudi_nic->mac_loopback)
+		phy_start_stop(gaudi_nic, false);
 
 	port_reset_state(gaudi_nic);
 
@@ -1882,6 +2286,19 @@ static int port_register(struct hl_device *hdev, int port)
 	ether_addr_copy(ndev->dev_addr,
 		hdev->asic_prop.cpucp_nic_info.mac_addrs[port].mac_addr);
 
+	/*
+	 * Reset the NIC macro PHY before the PHY configuration by each port.
+	 * This function resets all the 4 lanes in the PHY macro, therefore only
+	 * one of the two ports should call it.
+	 */
+	if (gaudi->nic_phy_config_fw && gaudi_nic->do_macro_cfg) {
+		rc = gaudi_nic_phy_reset_macro(gaudi_nic);
+		if (rc)
+			dev_err(hdev->dev,
+				"PHY power up 1 failed for port %d\n",
+				port);
+	}
+
 	if (register_netdev(ndev)) {
 		dev_err(hdev->dev,
 			"Could not register netdevice, port: %d\n", port);
@@ -2050,6 +2467,24 @@ int gaudi_nic_ports_init(struct hl_device *hdev)
 		cpucp_info->card_location =
 				cpu_to_le32((card_location >> 22) & 0x7);
 	}
+
+	if (gaudi->nic_phy_load_fw) {
+		rc = gaudi_nic_phy_has_fw(hdev);
+		if (rc) {
+			dev_err(hdev->dev, "NIC F/W file was not found\n");
+			return rc;
+		}
+
+		rc = gaudi_nic_phy_fw_load_all(hdev);
+		if (rc) {
+			dev_err(hdev->dev, "NIC F/W load for all failed\n");
+			return rc;
+		}
+	}
+
+	if (gaudi->nic_phy_config_fw)
+		dev_dbg(hdev->dev, "NIC F/W CRC: 0x%x\n",
+				gaudi_nic_phy_get_crc(hdev));
 
 	for (i = 0 ; i < NIC_NUMBER_OF_MACROS ; i++) {
 		gaudi->nic_macros[i].idx = i;
@@ -2271,6 +2706,21 @@ void gaudi_nic_ports_reopen(struct hl_device *hdev)
 
 		gaudi_nic = &gaudi->nic_devices[i];
 		port = gaudi_nic->port;
+
+		/*
+		 * Reset the NIC macro PHY before the PHY configuration by each
+		 * port. This function resets all the 4 lanes in the PHY macro,
+		 * therefore only one of the two ports should call it.
+		 * This must be called before we check if the port is enabled,
+		 * as the PHY reset should be called anyway.
+		 */
+		if (gaudi->nic_phy_config_fw && gaudi_nic->do_macro_cfg) {
+			rc = gaudi_nic_phy_reset_macro(gaudi_nic);
+			if (rc)
+				dev_err(hdev->dev,
+					"PHY power up 1 failed for port %d\n",
+					port);
+		}
 
 		/*
 		 * It could be that the port was shutdown by 'ifconfig down',

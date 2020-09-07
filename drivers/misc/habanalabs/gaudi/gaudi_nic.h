@@ -332,5 +332,22 @@ int gaudi_nic_port_reset(struct gaudi_nic_device *gaudi_nic);
 bool disabled_or_in_reset(struct gaudi_nic_device *gaudi_nic);
 u64 gaudi_nic_read_mac_stat_counter(struct hl_device *hdev, u32 port, int idx,
 					bool is_rx);
+int gaudi_nic_phy_reset_macro(struct gaudi_nic_device *gaudi_nic);
+int gaudi_nic_phy_power_up(struct gaudi_nic_device *gaudi_nic, int lane,
+				bool do_auto_neg);
+int gaudi_nic_phy_has_fw(struct hl_device *hdev);
+int gaudi_nic_phy_fw_tuning(struct gaudi_nic_device *gaudi_nic, int lane,
+				bool check_status);
+int gaudi_nic_phy_fw_load_all(struct hl_device *hdev);
+int gaudi_nic_phy_check_link_status(struct gaudi_nic_device *gaudi_nic,
+					int lane);
+int gaudi_nic_phy_config_pam4_link_training(struct gaudi_nic_device *gaudi_nic,
+						int lane);
+int gaudi_nic_phy_fw_config_auto_neg(struct gaudi_nic_device *gaudi_nic,
+					int lane);
+u16 gaudi_nic_phy_get_crc(struct hl_device *hdev);
+void gaudi_nic_phy_reset_tx(struct gaudi_nic_device *gaudi_nic, int lane);
+void gaudi_nic_phy_start_stop(struct gaudi_nic_device *gaudi_nic, int lane,
+				bool is_start);
 
 #endif /* GAUDI_NIC_DRV_H_ */

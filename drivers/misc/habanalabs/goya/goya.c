@@ -5269,6 +5269,14 @@ static enum hl_device_hw_state goya_get_hw_state(struct hl_device *hdev)
 	return RREG32(mmHW_STATE);
 }
 
+static int goya_get_mac_addr(struct hl_device *hdev,
+			struct hl_info_mac_addr *mac_addr)
+{
+	dev_err_ratelimited(hdev->dev,
+				"No MAC addresses are assigned to Goya\n");
+	return -ENXIO;
+}
+
 static int goya_ctx_init(struct hl_ctx *ctx)
 {
 	return 0;
@@ -5388,6 +5396,7 @@ static const struct hl_asic_funcs goya_funcs = {
 	.get_hw_state = goya_get_hw_state,
 	.pci_bars_map = goya_pci_bars_map,
 	.init_iatu = goya_init_iatu,
+	.get_mac_addr = goya_get_mac_addr,
 	.rreg = hl_rreg,
 	.wreg = hl_wreg,
 	.halt_coresight = goya_halt_coresight,

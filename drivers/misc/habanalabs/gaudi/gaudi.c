@@ -7473,6 +7473,7 @@ static const struct hl_asic_funcs gaudi_funcs = {
 	.get_hw_state = gaudi_get_hw_state,
 	.pci_bars_map = gaudi_pci_bars_map,
 	.init_iatu = gaudi_init_iatu,
+	.get_mac_addr = gaudi_nic_get_mac_addr,
 	.rreg = hl_rreg,
 	.wreg = hl_wreg,
 	.halt_coresight = gaudi_halt_coresight,

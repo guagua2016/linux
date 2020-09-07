@@ -619,6 +619,8 @@ enum div_select_defs {
 	DIV_SEL_DIVIDED_PLL = 3,
 };
 
+struct hl_info_mac_addr;
+
 /**
  * struct hl_asic_funcs - ASIC specific functions that are can be called from
  *                        common code.
@@ -696,6 +698,7 @@ enum div_select_defs {
  * @get_hw_state: retrieve the H/W state
  * @pci_bars_map: Map PCI BARs.
  * @init_iatu: Initialize the iATU unit inside the PCI controller.
+ * @get_mac_addr: Get list of MAC addresses.
  * @rreg: Read a register. Needed for simulator support.
  * @wreg: Write a register. Needed for simulator support.
  * @halt_coresight: stop the ETF and ETR traces.
@@ -799,6 +802,8 @@ struct hl_asic_funcs {
 	enum hl_device_hw_state (*get_hw_state)(struct hl_device *hdev);
 	int (*pci_bars_map)(struct hl_device *hdev);
 	int (*init_iatu)(struct hl_device *hdev);
+	int (*get_mac_addr)(struct hl_device *hdev,
+				struct hl_info_mac_addr *mac_addr);
 	u32 (*rreg)(struct hl_device *hdev, u32 reg);
 	void (*wreg)(struct hl_device *hdev, u32 reg, u32 val);
 	void (*halt_coresight)(struct hl_device *hdev);

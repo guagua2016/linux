@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
+#include <linux/if_ether.h>
 
 /*
  * Defines that are asic-specific but constitutes as ABI between kernel driver
@@ -248,6 +249,8 @@ enum hl_device_status {
  *                         internal engine.
  * HL_INFO_DEVICE_STATUS - Retrieve the device's status. This opcode doesn't
  *                         require an open context.
+ * HL_INFO_MAC_ADDR      - Retrieve the list of MAC addresses of the device's
+ *                         network ports, if the device has network ports.
  * HL_INFO_DEVICE_UTILIZATION  - Retrieve the total utilization of the device
  *                               over the last period specified by the user.
  *                               The period can be between 100ms to 1s, in
@@ -274,6 +277,7 @@ enum hl_device_status {
 #define HL_INFO_DRAM_USAGE		2
 #define HL_INFO_HW_IDLE			3
 #define HL_INFO_DEVICE_STATUS		4
+#define HL_INFO_MAC_ADDR		5
 #define HL_INFO_DEVICE_UTILIZATION	6
 #define HL_INFO_HW_EVENTS_AGGREGATE	7
 #define HL_INFO_CLK_RATE		8
@@ -285,8 +289,10 @@ enum hl_device_status {
 #define HL_INFO_SYNC_MANAGER		14
 #define HL_INFO_TOTAL_ENERGY		15
 
-#define HL_INFO_VERSION_MAX_LEN	128
+#define HL_INFO_VERSION_MAX_LEN		128
 #define HL_INFO_CARD_NAME_MAX_LEN	16
+
+#define HL_INFO_MAC_ADDR_MAX_NUM	128
 
 struct hl_info_hw_ip_info {
 	__u64 sram_base_address;
@@ -332,6 +338,18 @@ struct hl_info_hw_idle {
 struct hl_info_device_status {
 	__u32 status;
 	__u32 pad;
+};
+
+struct hl_mac_addr {
+	__u8 addr[ETH_ALEN];
+	__u8 pad[2];
+};
+
+struct hl_info_mac_addr {
+	/* MAC address at index N is of the corresponding PORT ID */
+	struct hl_mac_addr array[HL_INFO_MAC_ADDR_MAX_NUM];
+	/* Mask of valid entries at the MAC addresses array */
+	__u64 mask[2];
 };
 
 struct hl_info_device_utilization {
